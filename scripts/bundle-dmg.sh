@@ -101,7 +101,13 @@ if [[ "$BUNDLES" == *dmg* ]]; then
     echo "错误: 未在 $DMG_SRC 找到 .dmg 产物" >&2
     exit 1
   fi
-  cp "$DMG_SRC"/*.dmg "$DIST_DIR/"
+  # 复制 DMG 到产物目录，并给文件名加上品牌 "ikFilm+"（保持 productName
+  # 不变，避免包名/应用名受特殊字符影响）。
+  for dmg in "$DMG_SRC"/*.dmg; do
+    base="$(basename "$dmg")"
+    newname="${base/TheUnduster/TheUnduster ikFilm+}"
+    cp "$dmg" "$DIST_DIR/$newname"
+  done
   DMG_FILE="$(ls -t "$DIST_DIR"/*.dmg | head -1)"
   echo "DMG:  $DMG_FILE"
 fi
