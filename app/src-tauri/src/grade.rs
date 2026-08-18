@@ -86,6 +86,19 @@ pub struct GradeSettings {
     pub temperature: f32,
     /// Tint (green-magenta) in [-1, 1].
     pub tint: f32,
+    /// LUT (film-style look) to apply after grading, by key into the engine's
+    /// LUT registry (builtin like "kodak-endura" or a loaded .cube). None = no
+    /// LUT. The actual table travels separately as a `&LutData` so settings
+    /// stay small over IPC.
+    #[serde(default)]
+    pub lut_key: Option<String>,
+    /// LUT mix strength in [0, 1] (0 = no effect, 1 = full look).
+    #[serde(default = "default_lut_opacity")]
+    pub lut_opacity: f32,
+}
+
+fn default_lut_opacity() -> f32 {
+    1.0
 }
 
 impl Default for GradeSettings {
@@ -105,13 +118,99 @@ impl Default for GradeSettings {
             saturation: 0.0,
             temperature: 0.0,
             tint: 0.0,
+            lut_key: None,
+            lut_opacity: 1.0,
         }
+    }
+}
+
+/// A 1D per-channel lookup table (from an `.cube` `LUT_1D_SIZE` block or an
+/// equivalent curve). `data[i]` is the output RGB for input `i/(size-1)`.
+#[derive(Clone, Debug)]
+pub struct LutData {
+    pub size: usize,
+    pub data: Vec<[f32; 3]>,
+}
+
+/// Parses a 1D `.cube` LUT (also tolerates a `LUT_3D_SIZE` header by treating
+/// the table as 1D rows of the given count). The format is plain text:
+/// `LUT_1D_SIZE N` / `DOMAIN_MIN/MAX` lines, then N rows of `r g b` in [0,1].
+pub fn parse_cube(content: &str) -> Result<LutData, String> {
+    let mut size = 0usize;
+    let mut rows: Vec<[f32; 3]> = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("TITLE") || t.starts_with("DOMAIN")
+        {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("LUT_1D_SIZE") {
+            size = rest.trim().parse::<usize>().map_err(|_| "bad LUT_1D_SIZE".to_string())?;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("LUT_3D_SIZE") {
+            size = rest.trim().parse::<usize>().map_err(|_| "bad LUT_3D_SIZE".to_string())?;
+            // 3D tables are size^3 rows; we only consume the first `size` here
+            // (a 1D projection) for preview simplicity.
+            continue;
+        }
+        let mut it = t.split_whitespace();
+        let (Some(a), Some(b), Some(c)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let Ok(r) = a.parse::<f32>() else { continue };
+        let Ok(g) = b.parse::<f32>() else { continue };
+        let Ok(b) = c.parse::<f32>() else { continue };
+        rows.push([r, g, b]);
+        if size > 0 && rows.len() >= size {
+            break;
+        }
+    }
+    if rows.is_empty() {
+        return Err("no LUT rows parsed".to_string());
+    }
+    Ok(LutData {
+        size: rows.len(),
+        data: rows,
+    })
+}
+
+/// Applies a 1D LUT to display RGB (each channel looked up independently with
+/// linear interpolation), then blends with the original by `opacity`.
+pub fn apply_lut(rgb: [f32; 3], lut: &LutData, opacity: f32) -> [f32; 3] {
+    let n = lut.size.max(1) as f32;
+    let lookup = |v: f32| -> f32 {
+        let x = v.clamp(0.0, 1.0) * (n - 1.0);
+        let i = x.floor() as usize;
+        let j = (i + 1).min(lut.size - 1);
+        let f = x - i as f32;
+        let a = lut.data[i];
+        let b = lut.data[j];
+        let ch = |lo: f32, hi: f32| lo + (hi - lo) * f;
+        ch(a[0], b[0])
+    };
+    let out = [lookup(rgb[0]), lookup(rgb[1]), lookup(rgb[2])];
+    let o = opacity.clamp(0.0, 1.0);
+    [
+        rgb[0] + (out[0] - rgb[0]) * o,
+        rgb[1] + (out[1] - rgb[1]) * o,
+        rgb[2] + (out[2] - rgb[2]) * o,
+    ]
+}
+
+/// Applies the LUT (if any) after sRGB display encoding.
+fn final_display(rgb: [f32; 3], s: &GradeSettings, lut: Option<&LutData>) -> [f32; 3] {
+    let d = linear_srgb_to_display(rgb);
+    if let Some(lut) = lut {
+        apply_lut(d, lut, s.lut_opacity)
+    } else {
+        d
     }
 }
 
 /// Core per-pixel grade: returns display sRGB in [0,1]. Mirrors NexFilm's
 /// develop shader main() (invert branch) + pipeline.rs.
-pub fn grade_pixel(linear_rgb: [f32; 3], s: &GradeSettings) -> [f32; 3] {
+pub fn grade_pixel(linear_rgb: [f32; 3], s: &GradeSettings, lut: Option<&LutData>) -> [f32; 3] {
     const EPS: f32 = 1e-6;
     let mode = if s.mode == 0 { 0 } else { 1 };
 
@@ -128,11 +227,15 @@ pub fn grade_pixel(linear_rgb: [f32; 3], s: &GradeSettings) -> [f32; 3] {
             staged = [g, g, g];
         }
         let safe_gamma = s.gamma.max(1e-6);
-        return linear_srgb_to_display([
-            staged[0].powf(1.0 / safe_gamma),
-            staged[1].powf(1.0 / safe_gamma),
-            staged[2].powf(1.0 / safe_gamma),
-        ]);
+        return final_display(
+            [
+                staged[0].powf(1.0 / safe_gamma),
+                staged[1].powf(1.0 / safe_gamma),
+                staged[2].powf(1.0 / safe_gamma),
+            ],
+            s,
+            lut,
+        );
     }
 
     // Density: -log10(max(T, eps)).
@@ -188,7 +291,7 @@ pub fn grade_pixel(linear_rgb: [f32; 3], s: &GradeSettings) -> [f32; 3] {
     if mode == 1 {
         // B&W: tone then force gray; skip color balance/saturation.
         let g = tone_post_gamma(out[0], s.highlights, s.shadows);
-        return linear_srgb_to_display([g, g, g]);
+        return final_display([g, g, g], s, lut);
     }
 
     out = [
@@ -211,14 +314,14 @@ pub fn grade_pixel(linear_rgb: [f32; 3], s: &GradeSettings) -> [f32; 3] {
         luma + (out[2] - luma) * sat,
     ];
 
-    linear_srgb_to_display(out)
+    final_display(out, s, lut)
 }
 
 /// Applies grading to a whole image. The output keeps the source depth (U16
 /// stays 16-bit so downstream dust removal/export keeps precision; U8 stays
 /// 8-bit). Greyscale sources are graded as tri-channel (density in one
 /// channel) and emitted as RGB. Values are quantized back to the source depth.
-pub fn apply_grade(img: &ImageBuf, s: &GradeSettings) -> ImageBuf {
+pub fn apply_grade(img: &ImageBuf, s: &GradeSettings, lut: Option<&LutData>) -> ImageBuf {
     let w = img.width as usize;
     let h = img.height as usize;
     let n = w * h;
@@ -238,7 +341,7 @@ pub fn apply_grade(img: &ImageBuf, s: &GradeSettings) -> ImageBuf {
         PixelData::U16(_) => {
             let mut out: Vec<u16> = Vec::with_capacity(n * 3);
             for i in 0..n {
-                let p = grade_pixel(rgb_at(i, &src), s);
+                let p = grade_pixel(rgb_at(i, &src), s, lut);
                 out.push((p[0] * 65535.0).round() as u16);
                 out.push((p[1] * 65535.0).round() as u16);
                 out.push((p[2] * 65535.0).round() as u16);
@@ -255,7 +358,7 @@ pub fn apply_grade(img: &ImageBuf, s: &GradeSettings) -> ImageBuf {
         PixelData::U8(_) => {
             let mut out: Vec<u8> = Vec::with_capacity(n * 3);
             for i in 0..n {
-                let p = grade_pixel(rgb_at(i, &src), s);
+                let p = grade_pixel(rgb_at(i, &src), s, lut);
                 out.push((p[0] * 255.0).round() as u8);
                 out.push((p[1] * 255.0).round() as u8);
                 out.push((p[2] * 255.0).round() as u8);
@@ -351,7 +454,7 @@ mod tests {
             invert: true,
             ..Default::default()
         };
-        let out = apply_grade(&img, &ss);
+        let out = apply_grade(&img, &ss, None);
         let out_px = match &out.data {
             PixelData::U16(v) => v[0] as f32 / 65535.0,
             _ => 0.0,
@@ -367,7 +470,7 @@ mod tests {
             mode: 1,
             ..Default::default()
         };
-        let out = apply_grade(&img, &s);
+        let out = apply_grade(&img, &s, None);
         match &out.data {
             PixelData::U16(v) => {
                 assert_eq!(v[0], v[1]);
@@ -381,7 +484,7 @@ mod tests {
     fn staging_view_without_invert_keeps_negative() {
         let img = gray_img(0.9); // light negative pixel stays light when not inverted
         let s = GradeSettings::default(); // invert = false
-        let out = apply_grade(&img, &s);
+        let out = apply_grade(&img, &s, None);
         match &out.data {
             PixelData::U16(v) => {
                 let v0 = v[0] as f32 / 65535.0;

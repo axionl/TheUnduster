@@ -147,6 +147,14 @@
     return roiMode;
   }
 
+  /** Reload the frame's pixels from the backend (used after applying a color
+   * grade: the registry image is replaced, so cached GPU tile textures and
+   * the rAF loop must be refreshed to show the graded positive). */
+  export function reloadPixels() {
+    renderer?.clearTextures();
+    requestFrame();
+  }
+
   /** Toggles ROI box-selection mode. Shared by the r key branch and the
    * toolbar's Set ROI button. Exclusive with the brush and the wipe: both
    * own the canvas's pointer gesture, so entering the ROI draw drops them

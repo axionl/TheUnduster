@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { onMount } from "svelte";
 
   interface GradeSettings {
     invert: boolean;
@@ -14,9 +15,14 @@
     saturation: number;
     temperature: number;
     tint: number;
+    lut_key: string | null;
+    lut_opacity: number;
   }
 
-  let { imageId }: { imageId: number | null } = $props();
+  let {
+    imageId,
+    onApplied,
+  }: { imageId: number | null; onApplied?: () => void } = $props();
 
   function defaults(): GradeSettings {
     return {
@@ -32,11 +38,14 @@
       saturation: 0,
       temperature: 0,
       tint: 0,
+      lut_key: null,
+      lut_opacity: 1,
     };
   }
 
   let settings = $state<GradeSettings>(defaults());
   let preview = $state<string | null>(null);
+  let lutKeys = $state<string[]>([]);
   let busy = $state(false);
   let previewError = $state<string | null>(null);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -69,6 +78,46 @@
       previewError = String(e);
     }
   }
+
+  async function applyToClean() {
+    if (imageId == null) return;
+    try {
+      await invoke("apply_grade_to_frame", { id: imageId, settings });
+      onApplied?.();
+    } catch (e) {
+      previewError = String(e);
+    }
+  }
+
+  async function loadLuts() {
+    try {
+      lutKeys = await invoke<string[]>("list_luts");
+    } catch (e) {
+      /* ignore: no LUTs available */
+    }
+  }
+
+  function loadCube(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const key = file.name.replace(/\.cube$/i, "");
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        await invoke("load_lut", { key, content: String(reader.result) });
+        await loadLuts();
+        settings.lut_key = key;
+        refresh();
+      } catch (err) {
+        previewError = String(err);
+      }
+    };
+    reader.readAsText(file);
+    input.value = "";
+  }
+
+  onMount(loadLuts);
 
   // Refresh whenever the frame changes or settings change.
   $effect(() => {
@@ -105,6 +154,9 @@
       <div class="grade-head">
         <button class="btn btn-primary" onclick={autoInvert} title="自动分析片基密度与 D-Min/D-Max 并反相">
           Auto Invert
+        </button>
+        <button class="btn" onclick={applyToClean} title="应用校色到除尘：用正片替换当前图像，在除尘标签页检测与修复">
+          应用到除尘
         </button>
         <label class="grade-toggle">
           <input type="checkbox" bind:checked={settings.invert} onchange={refresh} />
@@ -161,6 +213,34 @@
           {/each}
         </div>
       {/each}
+
+      <div class="grade-row">
+        <span class="grade-label">胶片风格</span>
+        <select bind:value={settings.lut_key} onchange={refresh}>
+          <option value={null}>无</option>
+          {#each lutKeys as k}
+            <option value={k}>{k}</option>
+          {/each}
+        </select>
+      </div>
+      {#if settings.lut_key}
+        <div class="grade-row">
+          <span class="grade-label">LUT 强度</span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            bind:value={settings.lut_opacity}
+            oninput={scheduleRefresh}
+          />
+          <span class="grade-value">{settings.lut_opacity.toFixed(2)}</span>
+        </div>
+      {/if}
+      <label class="grade-toggle">
+        载入 .cube LUT
+        <input type="file" accept=".cube" onchange={loadCube} />
+      </label>
 
       {#if previewError}
         <p class="hint" style="color: var(--detect)">校色失败：{previewError}</p>

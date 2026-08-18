@@ -24,7 +24,10 @@
     "longDescription": "TheUnduster finds and removes dust and scratches from scanned film. Defect detection runs a neural network through ONNX Runtime, using CoreML on Apple Silicon with a CPU fallback. Healing uses LaMa inpainting.",
     "resources": {
       "../../engine/fixtures/demo-detector.onnx": "fixtures/demo-detector.onnx",
-      "../../engine/fixtures/tiny-detector.onnx": "fixtures/tiny-detector.onnx"
+      "../../engine/fixtures/tiny-detector.onnx": "fixtures/tiny-detector.onnx",
+      "resources/luts/kodak-endura.cube": "luts/kodak-endura.cube",
+      "resources/luts/kodak-ektacolor.cube": "luts/kodak-ektacolor.cube",
+      "resources/luts/ilford-mgfb2.cube": "luts/ilford-mgfb2.cube"
     },
     "macOS": {
       "minimumSystemVersion": "11.0",

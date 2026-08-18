@@ -574,6 +574,15 @@ export class TileRenderer {
     gl.disable(gl.BLEND);
   }
 
+  /** Drop every cached GPU tile texture (without disposing the context), so
+   * the next draw refetches tiles from the backend. Used when the frame's
+   * pixels are replaced (e.g. applying a color grade then cleaning): the
+   * image_id/level/coordinate keys are unchanged but the bytes are new, so
+   * the stale cached textures must not be reused. */
+  clearTextures(): void {
+    this.textures.clear();
+  }
+
   /** Release every GL resource and force the context to be dropped. The
    * Viewer is remounted per frame switch via `{#key info.id}`; without this,
    * each remount leaks a WebGL context (WebKit caps live contexts at ~16),

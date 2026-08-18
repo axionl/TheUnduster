@@ -625,6 +625,31 @@ impl Images {
         entry.components_memo = Some((quantize_prob(threshold), roi, boxes));
     }
 
+    /// Replaces an entry's pixels with a graded (negative->positive) copy,
+    /// rebuilding its display pyramid and clearing every derived layer
+    /// (probabilities, components memo, healed) so the dust-removal tab works
+    /// on the graded positive rather than the raw negative. The source stamp
+    /// is kept -- the underlying FILE hasn't changed, only this session's
+    /// view of it. The LRU tile cache for this image is evicted so stale
+    /// pyramid tiles aren't served. Returns false on an unknown id or a size
+    /// mismatch (grading never changes dimensions).
+    pub fn replace_image(&mut self, id: u64, graded: fd_io::ImageBuf) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        if graded.width != entry.image.width || graded.height != entry.image.height {
+            return false;
+        }
+        let arc = Arc::new(graded);
+        entry.image = arc.clone();
+        entry.pyramid = fd_tiles::Pyramid::build(&arc);
+        entry.probs = None;
+        entry.components_memo = None;
+        entry.healed = None;
+        self.cache.evict_image(id);
+        true
+    }
+
     pub fn close(&mut self, id: u64) {
         self.entries.remove(&id);
         self.cache.evict_image(id);

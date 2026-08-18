@@ -431,6 +431,10 @@ async fn heal_frame(
     result
 }
 
+/// Key -> parsed film-style LUT (builtin or user-loaded .cube). Kept in Tauri
+/// state so large LUT tables aren't shipped over IPC on every preview.
+type LutRegistry = Mutex<std::collections::HashMap<String, std::sync::Arc<grade::LutData>>>;
+
 /// Renders a downsampled, graded preview of a frame as a base64 PNG for the
 /// color-grade tab's live preview. The engine is pure Rust (`grade::apply_grade`),
 /// so dragging a slider recomputes a low-res preview (bounded by `max_edge`)
@@ -438,6 +442,7 @@ async fn heal_frame(
 #[tauri::command]
 fn grade_preview(
     images: State<'_, Mutex<Images>>,
+    luts: State<'_, LutRegistry>,
     id: u64,
     settings: grade::GradeSettings,
     max_edge: u32,
@@ -477,7 +482,11 @@ fn grade_preview(
         icc: None,
         exif: None,
     };
-    let graded = grade::apply_grade(&small, &settings);
+    let lut = settings
+        .lut_key
+        .as_ref()
+        .and_then(|k| luts.lock().ok()?.get(k).cloned());
+    let graded = grade::apply_grade(&small, &settings, lut.as_deref());
     let mut buf = Cursor::new(Vec::new());
     image::codecs::png::PngEncoder::new(&mut buf)
         .write_image(
@@ -514,6 +523,64 @@ fn grade_analyze(
         .image(id)
         .ok_or_else(|| format!("no image {id}"))?;
     Ok(grade::analyze_base_and_bounds(&img, low_quantile, high_quantile))
+}
+
+/// Applies a color grade to the frame's pixels in place, replacing the
+/// registry image with the graded positive so the dust-removal tab then
+/// detects and heals on the graded image (not the raw negative). The original
+/// file on disk is untouched. After this the frontend reloads the Viewer's
+/// tiles.
+#[tauri::command]
+fn apply_grade_to_frame(
+    images: State<'_, Mutex<Images>>,
+    luts: State<'_, LutRegistry>,
+    id: u64,
+    settings: grade::GradeSettings,
+) -> Result<(), String> {
+    let lut = settings
+        .lut_key
+        .as_ref()
+        .and_then(|k| luts.lock().ok()?.get(k).cloned());
+    let graded = {
+        let img = images
+            .lock()
+            .map_err(|e| e.to_string())?
+            .image(id)
+            .ok_or_else(|| format!("no image {id}"))?;
+        grade::apply_grade(&img, &settings, lut.as_deref())
+    };
+    let mut images = images.lock().map_err(|e| e.to_string())?;
+    if !images.replace_image(id, graded) {
+        return Err("cannot apply grade: frame closed or size mismatch".to_string());
+    }
+    Ok(())
+}
+
+/// Registers a parsed `.cube` LUT under `key` so `GradeSettings.lut_key` can
+/// reference it. `content` is the raw `.cube` text (the frontend reads the
+/// file). Also used to seed the builtin LUTs at startup.
+#[tauri::command]
+fn load_lut(
+    luts: State<'_, LutRegistry>,
+    key: String,
+    content: String,
+) -> Result<(), String> {
+    let lut = grade::parse_cube(&content)?;
+    luts.lock()
+        .map_err(|e| e.to_string())?
+        .insert(key, std::sync::Arc::new(lut));
+    Ok(())
+}
+
+/// Available LUT keys for the grade panel's style selector.
+#[tauri::command]
+fn list_luts(luts: State<'_, LutRegistry>) -> Vec<String> {
+    let mut keys: Vec<String> = luts
+        .lock()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
 }
 
 #[tauri::command]
@@ -2973,6 +3040,9 @@ pub fn run() {
         .manage(roll::RollState::default())
         .manage(jobs::JobQueue::default())
         .manage(models::ModelDownloadState::default())
+        // LUT registry: key -> parsed film-style lookup table (builtin or a
+        // user-loaded .cube). Referenced from `GradeSettings.lut_key`.
+        .manage(Mutex::new(std::collections::HashMap::<String, std::sync::Arc<grade::LutData>>::new()))
         .menu(build_menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open-scan" => {
@@ -3000,6 +3070,9 @@ pub fn run() {
             heal_cached,
             grade_preview,
             grade_analyze,
+            apply_grade_to_frame,
+            load_lut,
+            list_luts,
             healed_cached_all,
             components,
             open_roll,
@@ -3056,6 +3129,35 @@ pub fn run() {
                 let state = app.state::<detect::DetectorState>();
                 if state.load(&fixtures.join("demo-detector.onnx")).is_err() {
                     let _ = state.load(&fixtures.join("tiny-detector.onnx"));
+                }
+            }
+            // Register the packaged builtin film-style LUTs (Resources/luts)
+            // into the LUT registry, keyed by file stem ("kodak-endura", ...).
+            // Release loads them from the bundled resource dir; dev from the
+            // checked-in resources folder (tauri serves the same path layout).
+            {
+                use tauri::Manager;
+                let lut_dir = app
+                    .path()
+                    .resource_dir()
+                    .map(|d| d.join("luts"))
+                    .unwrap_or_default();
+                if let Ok(entries) = std::fs::read_dir(&lut_dir) {
+                    let registry = app.state::<LutRegistry>();
+                    let guard = registry.lock().map_err(|_| ()).ok();
+                    if let Some(mut reg) = guard {
+                        for e in entries.flatten() {
+                            let path = e.path();
+                            let key = path.file_stem().and_then(|s| s.to_str()).map(String::from);
+                            if let (Some(key), Ok(content)) =
+                                (key, std::fs::read_to_string(&path))
+                            {
+                                if let Ok(lut) = grade::parse_cube(&content) {
+                                    reg.insert(key, std::sync::Arc::new(lut));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             let inpainter = app.state::<detect::InpainterState>();

@@ -2211,7 +2211,18 @@
   <section class="stage">
     {#if info}
       {#if gradeTab}
-        <GradePanel imageId={info.id} />
+        <GradePanel
+          imageId={info.id}
+          onApplied={() => {
+            // The graded positive replaced the frame's pixels in the registry;
+            // jump to the dust-removal tab where the Viewer (remounting) shows
+            // the positive, and clear the stale detect state so the operator
+            // re-detects on the graded image.
+            gradeTab = false;
+            detected = false;
+            pushInfo("校色已应用；除尘页已显示正片，请重新检测");
+          }}
+        />
       {:else}
         <!-- One persistent Viewer: it reacts to `info` changing instead of
              being remounted, keeping the GL context and tile cache warm so
