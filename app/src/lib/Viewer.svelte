@@ -85,7 +85,6 @@
   // divider position as a fraction of canvas width.
   let wipeActive = $state(false);
   let splitActive = $state(false);
-  let sideActive = $state(false);
   let wipeT = $state(0.5);
   // $state: the `wipe-grab` class binding reads it reactively (unlike
   // `dragging`/`painting`, which only gate imperative handlers).
@@ -165,7 +164,6 @@
   export function toggleRoiMode() {
     if (wipeActive) wipeActive = false;
     splitActive = false;
-    sideActive = false;
     if (showHealed) showHealed = false;
     roiMode = !roiMode;
     if (roiMode) {
@@ -214,7 +212,6 @@
     showHealed = false;
     wipeActive = false;
     splitActive = false;
-    sideActive = false;
     wipeDragging = false;
     // Strokes themselves arrive per-frame via props and belong to App; only
     // the transient in-canvas brush mode resets here.
@@ -248,9 +245,7 @@
       showHealed = false;
       wipeActive = false;
       splitActive = false;
-      sideActive = false;
-    sideActive = false;
-    }
+      }
   });
 
   export async function refreshDetections(threshold: number, roiOverride?: Roi | null) {
@@ -548,6 +543,35 @@
     }
   }
 
+  // Overview (navigator) rectangle: the current viewport mapped onto the
+  // top-left thumbnail when zoomed in. Shown only while zoomed.
+  const OVERVIEW_W = 180;
+  const OVERVIEW_H = 135;
+  let overviewRect = $derived.by(() => {
+    if (canvas.width === 0) return { left: 0, top: 0, width: 0, height: 0 };
+    const lvl = info.levels[0];
+    const lw = lvl.width;
+    const lh = lvl.height;
+    const scale = Math.min(OVERVIEW_W / lw, OVERVIEW_H / lh);
+    const dispW = lw * scale;
+    const dispH = lh * scale;
+    const offX = (OVERVIEW_W - dispW) / 2;
+    const offY = (OVERVIEW_H - dispH) / 2;
+    // Viewport rect in image px.
+    const vw = canvas.width / zoom;
+    const vh = canvas.height / zoom;
+    const vx = (centerX - vw / 2) / info.width * lw;
+    const vy = (centerY - vh / 2) / info.height * lh;
+    const vx1 = (centerX + vw / 2) / info.width * lw;
+    const vy1 = (centerY + vh / 2) / info.height * lh;
+    return {
+      left: offX + vx * scale,
+      top: offY + vy * scale,
+      width: (vx1 - vx) * scale,
+      height: (vy1 - vy) * scale,
+    };
+  });
+
   function frame() {
     if (!running) return; // stopped on unmount; do not re-arm the rAF loop
     if (renderer && needsFrame) {
@@ -569,23 +593,6 @@
         });
         renderer.drawStrokes(
           [{ ax: 0, ay: mid, bx: canvas.width, by: mid, r: 1.5 }],
-          [1.0, 1.0, 1.0, 0.9],
-          canvas.width,
-          canvas.height,
-        );
-      } else if (sideActive) {
-        // Side-by-side compare: original left, healed right, fixed divider.
-        const mid = Math.round(canvas.width / 2);
-        renderer.draw(tilePaths(false), canvas.width, canvas.height, overlay, {
-          x0: 0,
-          x1: mid,
-        });
-        renderer.draw(tilePaths(true), canvas.width, canvas.height, overlay, {
-          x0: mid,
-          x1: canvas.width,
-        });
-        renderer.drawStrokes(
-          [{ ax: mid, ay: 0, bx: mid, by: canvas.height, r: 1.5 }],
           [1.0, 1.0, 1.0, 0.9],
           canvas.width,
           canvas.height,
@@ -670,7 +677,7 @@
       // side, and strokes painted across the divider would obscure it.
       // Strokes and the ROI affordances only render while the overlay is on:
       // with it off, show just the processed image (m toggles the overlay).
-      if (overlay.enabled && !showHealed && !wipeActive && !splitActive && !sideActive) {
+      if (overlay.enabled && !showHealed && !wipeActive && !splitActive) {
         const allStrokes =
           painting && livePoints.length > 0
             ? [
@@ -756,7 +763,6 @@
     // The ROI draw owns the pointer gesture the same way, so it drops too.
     if (wipeActive) wipeActive = false;
     splitActive = false;
-    sideActive = false;
     if (roiMode) roiMode = false;
     const turningOn = brushMode === "off";
     brushMode = brushMode === mode ? "off" : mode;
@@ -772,18 +778,12 @@
   // (space) toggle, which both contend for the same canvas.
   function toggleCompare() {
     if (!healedAvailable) return;
-    // Cycle: off -> split (default, original top / healed bottom) -> side
-    // (fixed left/right: original left, healed right) -> wipe (draggable
-    // left/right divider) -> off.
-    if (!splitActive && !sideActive && !wipeActive) {
+    // Cycle: off -> split (default compare, original top / healed bottom) ->
+    // wipe (draggable left/right divider) -> off.
+    if (!splitActive && !wipeActive) {
       splitActive = true;
     } else if (splitActive) {
       splitActive = false;
-      sideActive = false;
-    sideActive = false;
-      sideActive = true;
-    } else if (sideActive) {
-      sideActive = false;
       wipeActive = true;
     } else {
       wipeActive = false;
@@ -916,9 +916,7 @@
           // two compare modes from stacking confusingly.
           wipeActive = false;
           splitActive = false;
-      sideActive = false;
-    sideActive = false;
-          showHealed = false;
+            showHealed = false;
         } else {
           // The healed view is for inspecting the RESULT; a box-draw
           // interaction has no meaning there, so drop ROI mode with it.
@@ -1152,6 +1150,18 @@
     onpointermove={onPointerMove}
     onkeydown={onKey}
   ></canvas>
+  {#if !glError && zoom > 1.05}
+    <div class="overview" aria-hidden="true">
+      <img src={`tiles://localhost/${info.id}/0/0/0`} alt="" draggable="false" />
+      <div
+        class="overview-viewport"
+        style:left={`${overviewRect.left}px`}
+        style:top={`${overviewRect.top}px`}
+        style:width={`${overviewRect.width}px`}
+        style:height={`${overviewRect.height}px`}
+      ></div>
+    </div>
+  {/if}
   {#if !glError}
     <div class="palette tool-palette">
       <button
@@ -1284,6 +1294,33 @@
   }
   .brush-size input[type="range"] {
     width: 90px;
+  }
+  /* Overview navigator thumbnail (top-left, visible while zoomed). */
+  .overview {
+    position: absolute;
+    top: var(--space-2);
+    left: var(--space-2);
+    width: 180px;
+    height: 135px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-1);
+    overflow: hidden;
+    background: var(--bg-2);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+    z-index: 5;
+  }
+  .overview img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .overview-viewport {
+    position: absolute;
+    border: 1.5px solid var(--accent);
+    background: rgba(255, 255, 255, 0.06);
+    box-sizing: border-box;
   }
   .gl-error {
     color: var(--err);
