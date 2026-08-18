@@ -583,6 +583,44 @@ fn list_luts(luts: State<'_, LutRegistry>) -> Vec<String> {
     keys
 }
 
+/// Renders a small overview/navigator thumbnail of a frame's coarsest pyramid
+/// level as a base64 PNG data URL (for the Viewer's top-left overview while
+/// zoomed). `None` when the frame isn't resident.
+#[tauri::command]
+fn image_thumbnail(
+    images: State<'_, Mutex<Images>>,
+    id: u64,
+    max_edge: u32,
+) -> Result<Option<String>, String> {
+    use base64::Engine;
+    use image::ImageEncoder;
+    let (w, h, rgba) = {
+        let images = images.lock().map_err(|e| e.to_string())?;
+        images
+            .coarsest_rgba(id)
+            .ok_or_else(|| format!("no image {id}"))?
+    };
+    // Downsample the (already-small) coarsest level to the target edge.
+    let scale = (max_edge.max(1) as f32) / (w.max(h).max(1) as f32);
+    let tw = ((w as f32) * scale).max(1.0).round() as u32;
+    let th = ((h as f32) * scale).max(1.0).round() as u32;
+    let rgba_img = image::RgbaImage::from_raw(w, h, rgba).ok_or("bad rgba")?;
+    let thumb = image::imageops::thumbnail(&rgba_img, tw, th);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(
+            thumb.as_raw(),
+            tw,
+            th,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+    )))
+}
+
 #[tauri::command]
 fn load_inpainter(state: State<'_, detect::InpainterState>, path: String) -> Result<(), String> {
     state.load(std::path::Path::new(&path))
@@ -3066,6 +3104,7 @@ pub fn run() {
             load_detector,
             detect,
             load_inpainter,
+            image_thumbnail,
             heal_frame,
             heal_cached,
             grade_preview,

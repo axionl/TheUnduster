@@ -314,6 +314,15 @@ impl Images {
         self.entries.get(&id).map(|e| e.image.clone())
     }
 
+    /// The coarsest display-pyramid level (<= TILE, one tile = whole image)
+    /// as RGBA bytes, for an overview/navigator thumbnail. Returns
+    /// `(width, height, rgba)`.
+    pub fn coarsest_rgba(&self, id: u64) -> Option<(u32, u32, Vec<u8>)> {
+        let entry = self.entries.get(&id)?;
+        let l = entry.pyramid.levels.last()?;
+        Some((l.width, l.height, l.rgba.clone()))
+    }
+
     /// Snapshot of this entry's display-pyramid level dims, for building a
     /// matching prob pyramid outside the lock (see `set_probs_built`).
     pub fn level_dims(&self, id: u64) -> Option<Vec<(u32, u32)>> {

@@ -582,18 +582,13 @@
   $effect(() => {
     const id = info.id;
     ovUrl = null;
-    let revoke: (() => void) | undefined;
-    const lastIdx = info.levels.length - 1;
-    fetch(`tiles://localhost/${id}/${lastIdx}/0/0/0`)
-      .then((r) => (r.ok ? r.blob() : null))
-      .then((b) => {
-        if (b) {
-          ovUrl = URL.createObjectURL(b);
-          revoke = () => URL.revokeObjectURL(ovUrl!);
-        }
+    // Backend renders the coarsest pyramid level as a PNG data URL -- more
+    // reliable than loading the custom tiles:// protocol in an <img>.
+    invoke<string | null>("image_thumbnail", { id, maxEdge: 256 })
+      .then((d) => {
+        if (d) ovUrl = d;
       })
       .catch(() => {});
-    return () => revoke?.();
   });
 
   function frame() {
