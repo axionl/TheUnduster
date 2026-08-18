@@ -85,6 +85,7 @@
   // divider position as a fraction of canvas width.
   let wipeActive = $state(false);
   let splitActive = $state(false);
+  let sideActive = $state(false);
   let wipeT = $state(0.5);
   // $state: the `wipe-grab` class binding reads it reactively (unlike
   // `dragging`/`painting`, which only gate imperative handlers).
@@ -164,6 +165,7 @@
   export function toggleRoiMode() {
     if (wipeActive) wipeActive = false;
     splitActive = false;
+    sideActive = false;
     if (showHealed) showHealed = false;
     roiMode = !roiMode;
     if (roiMode) {
@@ -212,6 +214,7 @@
     showHealed = false;
     wipeActive = false;
     splitActive = false;
+    sideActive = false;
     wipeDragging = false;
     // Strokes themselves arrive per-frame via props and belong to App; only
     // the transient in-canvas brush mode resets here.
@@ -245,6 +248,8 @@
       showHealed = false;
       wipeActive = false;
       splitActive = false;
+      sideActive = false;
+    sideActive = false;
     }
   });
 
@@ -568,6 +573,23 @@
           canvas.width,
           canvas.height,
         );
+      } else if (sideActive) {
+        // Side-by-side compare: original left, healed right, fixed divider.
+        const mid = Math.round(canvas.width / 2);
+        renderer.draw(tilePaths(false), canvas.width, canvas.height, overlay, {
+          x0: 0,
+          x1: mid,
+        });
+        renderer.draw(tilePaths(true), canvas.width, canvas.height, overlay, {
+          x0: mid,
+          x1: canvas.width,
+        });
+        renderer.drawStrokes(
+          [{ ax: mid, ay: 0, bx: mid, by: canvas.height, r: 1.5 }],
+          [1.0, 1.0, 1.0, 0.9],
+          canvas.width,
+          canvas.height,
+        );
       } else if (wipeActive) {
         // Original left of the divider, healed right; each pass clears and
         // draws only its own scissored band, then a thin line marks the
@@ -648,7 +670,7 @@
       // side, and strokes painted across the divider would obscure it.
       // Strokes and the ROI affordances only render while the overlay is on:
       // with it off, show just the processed image (m toggles the overlay).
-      if (overlay.enabled && !showHealed && !wipeActive && !splitActive) {
+      if (overlay.enabled && !showHealed && !wipeActive && !splitActive && !sideActive) {
         const allStrokes =
           painting && livePoints.length > 0
             ? [
@@ -734,6 +756,7 @@
     // The ROI draw owns the pointer gesture the same way, so it drops too.
     if (wipeActive) wipeActive = false;
     splitActive = false;
+    sideActive = false;
     if (roiMode) roiMode = false;
     const turningOn = brushMode === "off";
     brushMode = brushMode === mode ? "off" : mode;
@@ -749,13 +772,18 @@
   // (space) toggle, which both contend for the same canvas.
   function toggleCompare() {
     if (!healedAvailable) return;
-    // Cycle: off -> split (default compare, original top / healed bottom) ->
-    // wipe (draggable left/right divider) -> off.
-    if (!splitActive && !wipeActive) {
+    // Cycle: off -> split (default, original top / healed bottom) -> side
+    // (fixed left/right: original left, healed right) -> wipe (draggable
+    // left/right divider) -> off.
+    if (!splitActive && !sideActive && !wipeActive) {
       splitActive = true;
-      wipeActive = false;
     } else if (splitActive) {
       splitActive = false;
+      sideActive = false;
+    sideActive = false;
+      sideActive = true;
+    } else if (sideActive) {
+      sideActive = false;
       wipeActive = true;
     } else {
       wipeActive = false;
@@ -888,6 +916,8 @@
           // two compare modes from stacking confusingly.
           wipeActive = false;
           splitActive = false;
+      sideActive = false;
+    sideActive = false;
           showHealed = false;
         } else {
           // The healed view is for inspecting the RESULT; a box-draw
