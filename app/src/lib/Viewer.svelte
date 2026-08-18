@@ -621,7 +621,9 @@
       // trying to inspect, so the space toggle shows the result unobscured.
       // Same rule for the wipe: its whole point is inspecting the healed
       // side, and strokes painted across the divider would obscure it.
-      if (!showHealed && !wipeActive) {
+      // Strokes and the ROI affordances only render while the overlay is on:
+      // with it off, show just the processed image (m toggles the overlay).
+      if (overlay.enabled && !showHealed && !wipeActive) {
         const allStrokes =
           painting && livePoints.length > 0
             ? [
@@ -651,8 +653,8 @@
       // The ROI dim-out/outline and live draw preview are drawn on the same
       // WebGL canvas as the image itself (not a stacked 2D canvas, which
       // breaks the WebGL surface in WKWebView), so they repaint together with
-      // the frame each rAF cycle.
-      drawRoiToCanvas();
+      // the frame each rAF cycle. Hidden when the overlay is off.
+      if (overlay.enabled) drawRoiToCanvas();
     }
     rafId = requestAnimationFrame(frame);
   }
