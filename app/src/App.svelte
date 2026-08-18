@@ -13,7 +13,11 @@
   import LogPanel from "./lib/LogPanel.svelte";
   import QueuePanel from "./lib/QueuePanel.svelte";
   import ShortcutsPanel from "./lib/ShortcutsPanel.svelte";
-  import { t, setLang, lang } from "./lib/i18n";
+  import { setLang, lang, dicts } from "./lib/i18n";
+  // Reactive translation fn: reads `$lang` so a language switch re-renders
+  // every `t(...)` call (a plain function calling get() would not be tracked
+  // by Svelte's fine-grained reactivity).
+  let t = $derived((k: string) => dicts[$lang][k] ?? k);
   import { composeQueueEntries, type QueueEntry, type QueueProgress } from "./lib/queue";
   import { countQueuedJobs, isExportRunning, runningKindAt } from "./lib/jobstate";
   import { isHealStale } from "./lib/heal";

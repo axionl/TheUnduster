@@ -119,7 +119,11 @@ const zh: Dict = {
   noPreview: "暂无预览",
 };
 
-const dict: Record<Lang, Dict> = { en, zh };
+/** Both language dictionaries, keyed by Lang. Exported so components can build
+ * a reactive `$derived` translation function that Svelte's fine-grained
+ * reactivity tracks (`dicts[$lang][key]`), which `get()` inside a plain
+ * function would not. */
+export const dicts: Record<Lang, Dict> = { en, zh };
 
 function initialLang(): Lang {
   try {
@@ -148,6 +152,6 @@ export function getLang(): Lang {
 
 /** Translate a key to the current language. */
 export function t(key: string): string {
-  const d = dict[get(lang)] ?? en;
+  const d = dicts[get(lang)] ?? en;
   return d[key] ?? key;
 }

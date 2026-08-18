@@ -1,7 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { t, lang } from "./i18n";
+  import { lang, dicts } from "./i18n";
+  // Reactive translation fn; reads `$lang` so a language switch re-renders.
+  let t = $derived((k: string) => dicts[$lang][k] ?? k);
 
   interface GradeSettings {
     invert: boolean;
