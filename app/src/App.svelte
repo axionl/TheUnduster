@@ -1616,6 +1616,15 @@
     }
   }
 
+  /** Reveal the models directory (where the current inpainting model lives). */
+  async function openModelDir() {
+    try {
+      await invoke("open_model_dir");
+    } catch (e) {
+      pushError(String(e));
+    }
+  }
+
   function modelProgressText(): string {
     return formatModelProgress(modelReceived, modelTotal);
   }
@@ -2044,10 +2053,10 @@
     <!-- File group: always visible -->
     <div class="toolbar-group">
       <button class="btn" title="Open scan" onclick={openScan} disabled={loading !== null}>
-        <Icon name="scan" /> {t("openScan")}
+        <Icon name="scan" /><span>{t("openScan")}</span>
       </button>
       <button class="btn" title="Open roll (folder)" onclick={openRoll} disabled={loading !== null}>
-        <Icon name="roll" /> {t("openRoll")}
+        <Icon name="roll" /><span>{t("openRoll")}</span>
       </button>
     </div>
 
@@ -2060,7 +2069,7 @@
           onclick={undoBrushStroke}
           disabled={currentStrokes().length === 0}
         >
-          <Icon name="undo" /> {t("undo")}
+          <Icon name="undo" /><span>{t("undo")}</span>
         </button>
         <button
           class="btn"
@@ -2068,7 +2077,7 @@
           onclick={redoBrushStroke}
           disabled={currentRedoStrokes().length === 0}
         >
-          <Icon name="redo" /> {t("redo")}
+          <Icon name="redo" /><span>{t("redo")}</span>
         </button>
         <button
           class="btn"
@@ -2076,7 +2085,7 @@
           onclick={requestDetect}
           disabled={loading !== null || isDetecting || detected}
         >
-          <Icon name="detect" /> {isDetecting ? t("detecting") : detected ? t("detected") : t("detect")}
+          <Icon name="detect" /><span>{isDetecting ? t("detecting") : detected ? t("detected") : t("detect")}</span>
         </button>
         <button
           class="btn btn-primary"
@@ -2086,7 +2095,7 @@
           onclick={requestHeal}
           disabled={loading !== null || isDetecting || isHealing || !info}
         >
-          <Icon name="heal" /> {isHealing ? t("healing") : t("heal")}
+          <Icon name="heal" /><span>{isHealing ? t("healing") : t("heal")}</span>
         </button>
         <button
           class="btn"
@@ -2110,7 +2119,7 @@
         </button>
         {#if !roll}
           <button class="btn" title="Export" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
-            <Icon name="export" /> {exportingSingle ? t("exporting") : t("export")}
+            <Icon name="export" /><span>{exportingSingle ? t("exporting") : t("export")}</span>
           </button>
         {/if}
       </div>
@@ -2121,11 +2130,11 @@
       <div class="toolbar-group">
         {#if roll.frames[currentIndex].approved}
           <button class="btn" title="Unapprove (shift-a)" onclick={unapproveCurrent}>
-            <Icon name="unapprove" /> {t("unapprove")}
+            <Icon name="unapprove" /><span>{t("unapprove")}</span>
           </button>
         {:else}
           <button class="btn" title="Approve (a)" onclick={approveCurrent}>
-            <Icon name="approve" /> {t("approve")}
+            <Icon name="approve" /><span>{t("approve")}</span>
           </button>
         {/if}
         <button
@@ -2136,7 +2145,7 @@
           onclick={healApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
-          <Icon name="heal" /> {t("healApproved")}
+          <Icon name="heal" /><span>{t("healApproved")}</span>
         </button>
         <button
           class="btn"
@@ -2144,7 +2153,7 @@
           onclick={exportApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
-          <Icon name="export" /> {t("exportApproved")}
+          <Icon name="export" /><span>{t("exportApproved")}</span>
         </button>
       </div>
     {/if}
@@ -2221,7 +2230,14 @@
         title="Open a custom ONNX inpainting model file"
         onclick={loadModelFile}
       >
-        <Icon name="download" /> {t("loadModel")}
+        <Icon name="download" /><span>{t("loadModel")}</span>
+      </button>
+      <button
+        class="btn"
+        title="Open the model folder in Finder"
+        onclick={openModelDir}
+      >
+        <Icon name="folder" /><span>{t("modelFolder")}</span>
       </button>
     </div>
     <!-- Language switch: English / 中文 -->
@@ -2305,8 +2321,8 @@
         </svg>
         <p class="empty-title">{t("noScanOpen")}</p>
         <div class="empty-actions">
-          <button class="btn" onclick={openScan}><Icon name="scan" /> {t("openScan")}</button>
-          <button class="btn" onclick={openRoll}><Icon name="roll" /> {t("openRoll")}</button>
+          <button class="btn" onclick={openScan}><Icon name="scan" /><span>{t("openScan")}</span></button>
+          <button class="btn" onclick={openRoll}><Icon name="roll" /><span>{t("openRoll")}</span></button>
         </div>
         <p class="hint">{t("dropHint")}</p>
       </div>
@@ -2391,6 +2407,18 @@
     flex: 1;
     min-height: 0;
     position: relative;
+  }
+  /* Toolbar buttons: icon above label (vertical), to keep the toolbar narrow
+     and leave horizontal room for more actions. Only applies inside the
+     header toolbar, not the workflow tabs or the canvas palettes. */
+  .toolbar .btn {
+    flex-direction: column;
+    gap: 1px;
+    padding: 3px 8px;
+    line-height: 1.1;
+    text-align: center;
+    white-space: nowrap;
+    min-height: 34px;
   }
   .brand {
     align-items: center;

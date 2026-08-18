@@ -37,6 +37,7 @@ const en: Dict = {
   cancel: "Cancel",
   cancelling: "Cancelling",
   loadModel: "Load Model",
+  modelFolder: "Model Folder",
   // Empty state
   noScanOpen: "no scan open",
   dropHint: "or drop a scan or a roll folder anywhere in this window",
@@ -93,6 +94,7 @@ const zh: Dict = {
   cancel: "取消",
   cancelling: "取消中",
   loadModel: "加载模型",
+  modelFolder: "模型目录",
   noScanOpen: "未打开扫描",
   dropHint: "或把扫描/胶卷文件夹拖到窗口任意位置",
   autoInvert: "自动反相",

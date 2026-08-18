@@ -12,6 +12,7 @@
     | "erase"
     | "overlay"
     | "compare"
+    | "folder"
     | "undo"
     | "redo"
     | "roi"
@@ -36,6 +37,7 @@
     // A framed image split down the middle -- the wipe divider between a
     // before and after half.
     compare: "M4 5h16v14H4z M12 5v14",
+    folder: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
     // Corner brackets framing a region -- the region-of-interest selector.
     roi: "M4 8V5a1 1 0 0 1 1-1h3 M16 4h3a1 1 0 0 1 1 1v3 M20 16v3a1 1 0 0 1-1 1h-3 M8 20H5a1 1 0 0 1-1-1v-3",
     // A framed region crossed out -- removing the region of interest.

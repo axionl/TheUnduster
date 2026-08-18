@@ -3096,7 +3096,8 @@ pub fn run() {
             models::inpainter_status,
             models::inpainter_load_error,
             models::download_inpaint_model,
-            models::cancel_model_download
+            models::cancel_model_download,
+            models::open_model_dir
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();

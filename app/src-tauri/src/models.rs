@@ -122,6 +122,28 @@ pub fn lama_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(models_dir(app)?.join("lama.onnx"))
 }
 
+/// Reveals the models directory (where the inpainting model lives) in the
+/// platform file manager, so the operator can locate/inspect the current
+/// model file.
+#[tauri::command]
+pub fn open_model_dir(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = models_dir(&app)?;
+    // macOS: `open <dir>` opens Finder on that folder. (Other platforms could
+    // use `xdg-open`/`explorer`; macOS is the current target.)
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("failed to open {}: {e}", dir.display()))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 /// File name for the in-progress download before it is verified and renamed
 /// into place. The `tmp-unduster` marker keeps it visually distinct from a
 /// real model file (and is what `sweep_stale_temps` filters on); the pid
