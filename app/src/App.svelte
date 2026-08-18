@@ -6,6 +6,7 @@
   import Viewer from "./lib/Viewer.svelte";
   import GradePanel from "./lib/GradePanel.svelte";
   import Icon from "./lib/Icon.svelte";
+  import logoUrl from "./assets/logo.png";
   import Filmstrip from "./lib/Filmstrip.svelte";
   import StatusBar from "./lib/StatusBar.svelte";
   import Toasts from "./lib/Toasts.svelte";
@@ -2013,6 +2014,11 @@
 
 <div class="shell">
   <header class="toolbar">
+    <!-- Brand: small app logo + title -->
+    <div class="toolbar-group brand">
+      <img class="brand-logo" src={logoUrl} alt="TheUnduster" />
+      <span class="brand-title">TheUnduster <span class="brand-sub">| ikFilm+</span></span>
+    </div>
     <!-- File group: always visible -->
     <div class="toolbar-group">
       <button class="btn" title="Open scan" onclick={openScan} disabled={loading !== null}>
@@ -2344,11 +2350,32 @@
     min-height: 0;
     position: relative;
   }
+  .brand {
+    align-items: center;
+    gap: var(--space-2);
+    margin-right: var(--space-2);
+    padding-right: var(--space-3);
+    border-right: 1px solid var(--border);
+  }
+  .brand-logo {
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+  }
+  .brand-title {
+    font-weight: 600;
+    font-size: var(--text-sm);
+    color: var(--text-1);
+    white-space: nowrap;
+  }
+  .brand-sub {
+    color: var(--accent);
+    font-weight: 700;
+  }
   .workflow-tabs {
     display: flex;
     gap: var(--space-1);
-    padding: 0 var(--space-3);
-    padding-top: var(--space-1);
+    padding: 0 var(--space-3);    padding-top: var(--space-1);
     border-bottom: 1px solid var(--border);
   }
   .workflow-tab {
