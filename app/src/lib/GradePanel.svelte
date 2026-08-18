@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import { t, lang } from "./i18n";
 
   interface GradeSettings {
     invert: boolean;
@@ -137,52 +138,53 @@
     return { label, field, min, max, step };
   }
   const channelRows = $derived([
-    channelRow("Base density", "base_density", -1, 4, 0.01),
-    channelRow("Exposure", "exposure", -2, 2, 0.01),
-    channelRow("D-Min", "d_min", -1, 4, 0.01),
-    channelRow("D-Max", "d_max", -1, 4, 0.01),
+    channelRow(t("baseDensity"), "base_density", -1, 4, 0.01),
+    channelRow(t("exposure"), "exposure", -2, 2, 0.01),
+    channelRow(t("dMin"), "d_min", -1, 4, 0.01),
+    channelRow(t("dMax"), "d_max", -1, 4, 0.01),
   ]);
 </script>
 
+<span style="display:none">{$lang}</span>
 {#if imageId == null}
   <div class="grade-empty">
-    <p class="hint">打开一张胶片扫描后即可校色（负片反相、密度、曝光、Gamma、白平衡…）</p>
+    <p class="hint">{t("noGradeHint")}</p>
   </div>
 {:else}
   <div class="grade-workspace">
     <div class="grade-panel">
       <div class="grade-head">
         <button class="btn btn-primary" onclick={autoInvert} title="自动分析片基密度与 D-Min/D-Max 并反相">
-          Auto Invert
+          {t("autoInvert")}
         </button>
         <button class="btn" onclick={applyToClean} title="应用校色到除尘：用正片替换当前图像，在除尘标签页检测与修复">
-          应用到除尘
+          {t("applyToClean")}
         </button>
         <label class="grade-toggle">
           <input type="checkbox" bind:checked={settings.invert} onchange={refresh} />
-          反相 (Invert)
+          {t("invert")}
         </label>
         <label class="grade-toggle">
           <select bind:value={settings.mode} onchange={refresh}>
-            <option value={0}>Color</option>
-            <option value={1}>B&W</option>
+            <option value={0}>{t("color")}</option>
+            <option value={1}>{t("bw")}</option>
           </select>
-          模式
+          {t("mode")}
         </label>
       </div>
 
       <div class="grade-row">
-        <span class="grade-label">Gamma</span>
+        <span class="grade-label">{t("gamma")}</span>
         <input type="range" min="0.2" max="3" step="0.05" bind:value={settings.gamma} oninput={scheduleRefresh} />
         <span class="grade-value">{settings.gamma.toFixed(2)}</span>
       </div>
 
       {#each [
-        { label: "Highlights", key: "highlights" },
-        { label: "Shadows", key: "shadows" },
-        { label: "Saturation", key: "saturation" },
-        { label: "Temperature", key: "temperature" },
-        { label: "Tint", key: "tint" },
+        { label: t("highlights"), key: "highlights" },
+        { label: t("shadows"), key: "shadows" },
+        { label: t("saturation"), key: "saturation" },
+        { label: t("temperature"), key: "temperature" },
+        { label: t("tint"), key: "tint" },
       ] as r}
         <div class="grade-row">
           <span class="grade-label">{r.label}</span>
@@ -215,9 +217,9 @@
       {/each}
 
       <div class="grade-row">
-        <span class="grade-label">胶片风格</span>
+        <span class="grade-label">{t("filmStyle")}</span>
         <select bind:value={settings.lut_key} onchange={refresh}>
-          <option value={null}>无</option>
+          <option value={null}>{t("none")}</option>
           {#each lutKeys as k}
             <option value={k}>{k}</option>
           {/each}
@@ -225,7 +227,7 @@
       </div>
       {#if settings.lut_key}
         <div class="grade-row">
-          <span class="grade-label">LUT 强度</span>
+          <span class="grade-label">{t("lutStrength")}</span>
           <input
             type="range"
             min="0"
@@ -238,7 +240,7 @@
         </div>
       {/if}
       <label class="grade-toggle">
-        载入 .cube LUT
+        {t("loadCubeLut")}
         <input type="file" accept=".cube" onchange={loadCube} />
       </label>
 
@@ -249,13 +251,13 @@
 
     <div class="grade-preview">
       <div class="grade-preview-title">
-        <span>校色预览</span>
-        {#if busy}<span class="hint">更新中…</span>{/if}
+        <span>{t("gradePreview")}</span>
+        {#if busy}<span class="hint">{t("updating")}</span>{/if}
       </div>
       {#if preview}
         <img src={`data:image/png;base64,${preview}`} alt="校色预览" />
       {:else}
-        <p class="hint">暂无预览</p>
+        <p class="hint">{t("noPreview")}</p>
       {/if}
     </div>
   </div>

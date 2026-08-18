@@ -13,6 +13,7 @@
   import LogPanel from "./lib/LogPanel.svelte";
   import QueuePanel from "./lib/QueuePanel.svelte";
   import ShortcutsPanel from "./lib/ShortcutsPanel.svelte";
+  import { t, setLang, lang } from "./lib/i18n";
   import { composeQueueEntries, type QueueEntry, type QueueProgress } from "./lib/queue";
   import { countQueuedJobs, isExportRunning, runningKindAt } from "./lib/jobstate";
   import { isHealStale } from "./lib/heal";
@@ -2016,16 +2017,16 @@
   <header class="toolbar">
     <!-- Brand: small app logo + title -->
     <div class="toolbar-group brand">
-      <img class="brand-logo" src={logoUrl} alt="TheUnduster" />
-      <span class="brand-title">TheUnduster <span class="brand-sub">| ikFilm+</span></span>
+      <img class="brand-logo" src={logoUrl} alt={t("appName")} />
+      <span class="brand-title">{t("appName")} <span class="brand-sub">{t("appSuffix")}</span></span>
     </div>
     <!-- File group: always visible -->
     <div class="toolbar-group">
       <button class="btn" title="Open scan" onclick={openScan} disabled={loading !== null}>
-        <Icon name="scan" /> Open scan
+        <Icon name="scan" /> {t("openScan")}
       </button>
       <button class="btn" title="Open roll (folder)" onclick={openRoll} disabled={loading !== null}>
-        <Icon name="roll" /> Open roll
+        <Icon name="roll" /> {t("openRoll")}
       </button>
     </div>
 
@@ -2038,7 +2039,7 @@
           onclick={undoBrushStroke}
           disabled={currentStrokes().length === 0}
         >
-          <Icon name="undo" /> Undo
+          <Icon name="undo" /> {t("undo")}
         </button>
         <button
           class="btn"
@@ -2046,7 +2047,7 @@
           onclick={redoBrushStroke}
           disabled={currentRedoStrokes().length === 0}
         >
-          <Icon name="redo" /> Redo
+          <Icon name="redo" /> {t("redo")}
         </button>
         <button
           class="btn"
@@ -2054,7 +2055,7 @@
           onclick={requestDetect}
           disabled={loading !== null || isDetecting || detected}
         >
-          <Icon name="detect" /> {isDetecting ? "Detecting..." : detected ? "Detected" : "Detect"}
+          <Icon name="detect" /> {isDetecting ? t("detecting") : detected ? t("detected") : t("detect")}
         </button>
         <button
           class="btn btn-primary"
@@ -2064,7 +2065,7 @@
           onclick={requestHeal}
           disabled={loading !== null || isDetecting || isHealing || !info}
         >
-          <Icon name="heal" /> {isHealing ? "Healing..." : "Heal"}
+          <Icon name="heal" /> {isHealing ? t("healing") : t("heal")}
         </button>
         <button
           class="btn"
@@ -2088,7 +2089,7 @@
         </button>
         {#if !roll}
           <button class="btn" title="Export" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
-            <Icon name="export" /> {exportingSingle ? "Exporting..." : "Export"}
+            <Icon name="export" /> {exportingSingle ? t("exporting") : t("export")}
           </button>
         {/if}
       </div>
@@ -2099,11 +2100,11 @@
       <div class="toolbar-group">
         {#if roll.frames[currentIndex].approved}
           <button class="btn" title="Unapprove (shift-a)" onclick={unapproveCurrent}>
-            <Icon name="unapprove" /> Unapprove
+            <Icon name="unapprove" /> {t("unapprove")}
           </button>
         {:else}
           <button class="btn" title="Approve (a)" onclick={approveCurrent}>
-            <Icon name="approve" /> Approve
+            <Icon name="approve" /> {t("approve")}
           </button>
         {/if}
         <button
@@ -2114,7 +2115,7 @@
           onclick={healApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
-          <Icon name="heal" /> Heal approved
+          <Icon name="heal" /> {t("healApproved")}
         </button>
         <button
           class="btn"
@@ -2122,7 +2123,7 @@
           onclick={exportApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
-          <Icon name="export" /> Export approved
+          <Icon name="export" /> {t("exportApproved")}
         </button>
       </div>
     {/if}
@@ -2182,16 +2183,26 @@
           <button class="btn" onclick={downloadModel}>
             <Icon name="download" />
             {#if modelStatus === "missing"}
-              Download healing model (207 MB)
+              {t("downloadModel")}
             {:else if modelStatus === "available"}
-              Repair healing model
+              {t("repairModel")}
             {:else if modelStatus === "fixture"}
-              Download real healing model (207 MB)
+              {t("downloadRealModel")}
             {/if}
           </button>
         {/if}
       </div>
     {/if}
+    <!-- Language switch: English / 中文 -->
+    <div class="toolbar-group lang-group">
+      <button
+        class="btn lang-toggle"
+        title={$lang === "en" ? "切换语言" : "Switch language"}
+        onclick={() => setLang($lang === "en" ? "zh" : "en")}
+      >
+        {$lang === "en" ? "EN" : "中文"}
+      </button>
+    </div>
   </header>
   <!-- Workflow tabs: color grade first, then dust removal, then export. -->
   <div class="workflow-tabs" role="tablist" aria-label="工作流">
@@ -2202,7 +2213,7 @@
       aria-selected={!gradeTab}
       onclick={() => (gradeTab = false)}
     >
-      <Icon name="paint" /> 除尘
+      <Icon name="paint" /> {t("tabClean")}
     </button>
     <button
       class="workflow-tab"
@@ -2211,7 +2222,7 @@
       aria-selected={gradeTab}
       onclick={() => (gradeTab = true)}
     >
-      <Icon name="overlay" /> 校色
+      <Icon name="overlay" /> {t("tabGrade")}
     </button>
   </div>
   <section class="stage">
@@ -2261,12 +2272,12 @@
           <rect x="4" y="6" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="14" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="22" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="30" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="38" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="46" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="54" width="4" height="4" fill="var(--bg-3)" />
           <rect x="88" y="6" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="14" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="22" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="30" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="38" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="46" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="54" width="4" height="4" fill="var(--bg-3)" />
         </svg>
-        <p class="empty-title">no scan open</p>
+        <p class="empty-title">{t("noScanOpen")}</p>
         <div class="empty-actions">
-          <button class="btn" onclick={openScan}><Icon name="scan" /> Open scan</button>
-          <button class="btn" onclick={openRoll}><Icon name="roll" /> Open roll</button>
+          <button class="btn" onclick={openScan}><Icon name="scan" /> {t("openScan")}</button>
+          <button class="btn" onclick={openRoll}><Icon name="roll" /> {t("openRoll")}</button>
         </div>
-        <p class="hint">or drop a scan or a roll folder anywhere in this window</p>
+        <p class="hint">{t("dropHint")}</p>
       </div>
     {/if}
     {#if showLoader}
