@@ -2106,7 +2106,7 @@
           disabled={loading !== null}
           onclick={() => viewer?.toggleRoiMode()}
         >
-          <Icon name="roi" /> Set ROI
+          <Icon name="roi" /><span>{t("setRoi")}</span>
         </button>
         <button
           class="btn"
@@ -2115,7 +2115,7 @@
           onclick={() => onRoiChange(null)}
           disabled={currentRoi === null || loading !== null}
         >
-          <Icon name="clear" /> Clear ROI
+          <Icon name="clear" /><span>{t("clearRoi")}</span>
         </button>
         {#if !roll}
           <button class="btn" title="Export" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
