@@ -4,6 +4,8 @@
   import Icon from "./Icon.svelte";
   import { fitZoom, visibleTiles, ringsFor, ringForBbox, wheelZoomFactor, TILE, type Level } from "./viewport";
   import { TileRenderer, probPathFor, type StrokeSegment } from "./renderer";
+  import { lang, dicts } from "./i18n";
+  let t = $derived((k: string) => dicts[$lang][k] ?? k);
   import {
     screenToImage,
     stepRadius,
@@ -549,7 +551,8 @@
   const OVERVIEW_H = 135;
   let overviewRect = $derived.by(() => {
     if (canvas.width === 0) return { left: 0, top: 0, width: 0, height: 0 };
-    const lvl = info.levels[0];
+    // Coarsest level (last) is <= TILE: one tile covers the whole image.
+    const lvl = info.levels[info.levels.length - 1];
     const lw = lvl.width;
     const lh = lvl.height;
     const scale = Math.min(OVERVIEW_W / lw, OVERVIEW_H / lh);
@@ -570,6 +573,27 @@
       width: (vx1 - vx) * scale,
       height: (vy1 - vy) * scale,
     };
+  });
+
+  // Overview thumbnail bytes, fetched via the tiles:// protocol and exposed
+  // as a blob URL (an <img> cannot load the custom protocol directly in some
+  // webviews). Refetch when the frame changes.
+  let ovUrl = $state<string | null>(null);
+  $effect(() => {
+    const id = info.id;
+    ovUrl = null;
+    let revoke: (() => void) | undefined;
+    const lastIdx = info.levels.length - 1;
+    fetch(`tiles://localhost/${id}/${lastIdx}/0/0/0`)
+      .then((r) => (r.ok ? r.blob() : null))
+      .then((b) => {
+        if (b) {
+          ovUrl = URL.createObjectURL(b);
+          revoke = () => URL.revokeObjectURL(ovUrl!);
+        }
+      })
+      .catch(() => {});
+    return () => revoke?.();
   });
 
   function frame() {
@@ -1152,7 +1176,7 @@
   ></canvas>
   {#if !glError && zoom > 1.05}
     <div class="overview" aria-hidden="true">
-      <img src={`tiles://localhost/${info.id}/0/0/0`} alt="" draggable="false" />
+      <img src={ovUrl ?? undefined} alt="" draggable="false" />
       <div
         class="overview-viewport"
         style:left={`${overviewRect.left}px`}
@@ -1227,7 +1251,7 @@
       <button class="btn" title="Zoom out (-)" aria-label="Zoom out" onclick={zoomOut}>&minus;</button>
       <span class="zoom-readout">{Math.round(zoom * 100)}%</span>
       <button class="btn" title="Zoom in (+)" aria-label="Zoom in" onclick={zoomIn}>+</button>
-      <button class="btn" title="Fit (0)" aria-label="Fit to window" onclick={zoomFit}>Fit</button>
+      <button class="btn" title="Fit (0)" aria-label="Fit to window" onclick={zoomFit}><span>{t("fit")}</span></button>
       <button class="btn" title="100% (1)" aria-label="Actual size" onclick={zoomActual}>1:1</button>
     </div>
   {/if}
