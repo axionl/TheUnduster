@@ -15,6 +15,17 @@ use crate::detect::InpainterState;
 /// URL can never silently start serving a different file.
 pub const LAMA_URL: &str = "https://huggingface.co/Carve/LaMa-ONNX/resolve/c3c0c9e468934d62e79c329e35d82dd09ff8c444/lama_fp32.onnx";
 
+/// Same pinned revision served by the hf-mirror.com mirror (common in
+/// regions where huggingface.co is blocked). The bytes must match the
+/// official one -- enforced by the shared `LAMA_SHA256` check, so a mirror
+/// serving a corrupt/different file is treated as a failed candidate.
+const LAMA_MIRROR_URL: &str = "https://hf-mirror.com/Carve/LaMa-ONNX/resolve/c3c0c9e468934d62e79c329e35d82dd09ff8c444/lama_fp32.onnx";
+
+/// Candidate sources tried in order: the official hub first, then the mirror.
+/// Download succeeds on the first candidate that delivers a checksum-valid
+/// file; each candidate's bytes are verified against `LAMA_SHA256`.
+const LAMA_CANDIDATES: [&str; 2] = [LAMA_URL, LAMA_MIRROR_URL];
+
 /// SHA-256 of `lama_fp32.onnx` at revision c3c0c9e468934d62e79c329e35d82dd09ff8c444,
 /// computed locally with `shasum -a 256` after downloading LAMA_URL.
 pub const LAMA_SHA256: &str = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6";
@@ -286,19 +297,56 @@ async fn run_download(app: &tauri::AppHandle, inpainter: &InpainterState) -> Res
         }
     }
     let client = builder.build().map_err(|e| e.to_string())?;
-    let response = client
-        .get(LAMA_URL)
-        .send()
+    // Try each candidate source in order (official hub, then the hf-mirror).
+    // A source fails if it can't connect, returns a non-2xx, stalls, or (most
+    // importantly) delivers bytes that fail the pinned SHA-256 -- so a mirror
+    // serving a different/corrupt file is never trusted.
+    let mut last_err = "download failed".to_string();
+    for url in LAMA_CANDIDATES {
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = download_to(&client, url, &tmp, app).await {
+            last_err = format!("{url}: {e}");
+            #[cfg(debug_assertions)]
+            eprintln!("[models] download from {url} failed ({e}); trying next source");
+            continue;
+        }
+        let verify_path = tmp.clone();
+        let verify = tauri::async_runtime::spawn_blocking(move || {
+            verify_sha256(&verify_path, LAMA_SHA256)
+        })
         .await
         .map_err(|e| e.to_string())?;
+        if let Err(e) = verify {
+            last_err = format!("{url}: {e}");
+            let _ = std::fs::remove_file(&tmp);
+            continue;
+        }
+        std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
+        let inpainter = inpainter.clone();
+        let load_path = final_path.clone();
+        tauri::async_runtime::spawn_blocking(move || inpainter.load(&load_path))
+            .await
+            .map_err(|e| e.to_string())??;
+        return Ok(());
+    }
+    Err(last_err)
+}
+
+/// Streams one candidate URL to `tmp`, overwriting it. No checksum here; the
+/// caller verifies the bytes after a successful download.
+async fn download_to(
+    client: &reqwest::Client,
+    url: &str,
+    tmp: &std::path::Path,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("download failed: HTTP {}", response.status()));
+        return Err(format!("HTTP {}", response.status()));
     }
     let total = response.content_length();
     let mut received: u64 = 0;
-    let mut file = tokio::fs::File::create(&tmp)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut file = tokio::fs::File::create(tmp).await.map_err(|e| e.to_string())?;
     let mut stream = response.bytes_stream();
     let mut last_emit = std::time::Instant::now();
     use futures_util::StreamExt;
@@ -330,20 +378,6 @@ async fn run_download(app: &tauri::AppHandle, inpainter: &InpainterState) -> Res
     }
     file.flush().await.map_err(|e| e.to_string())?;
     drop(file);
-
-    let verify_path = tmp.clone();
-    tauri::async_runtime::spawn_blocking(move || verify_sha256(&verify_path, LAMA_SHA256))
-        .await
-        .map_err(|e| e.to_string())??;
-
-    std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
-
-    let inpainter = inpainter.clone();
-    let load_path = final_path.clone();
-    tauri::async_runtime::spawn_blocking(move || inpainter.load(&load_path))
-        .await
-        .map_err(|e| e.to_string())??;
-
     Ok(())
 }
 
