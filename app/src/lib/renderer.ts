@@ -364,15 +364,23 @@ export class TileRenderer {
     canvasW: number,
     canvasH: number,
     overlay: { enabled: boolean; threshold: number },
-    clip?: { x0: number; x1: number },
+    clip?: { x0: number; x1: number; y0?: number; y1?: number },
   ): void {
     const gl = this.gl;
     gl.viewport(0, 0, canvasW, canvasH);
     if (clip) {
       gl.enable(gl.SCISSOR_TEST);
-      // Scissor is bottom-left-origin, but a full-height horizontal band is
-      // origin-agnostic in y.
-      gl.scissor(Math.round(clip.x0), 0, Math.max(0, Math.round(clip.x1 - clip.x0)), canvasH);
+      // Scissor is bottom-left-origin; the caller's coords are top-left
+      // canvas px. Default y0/y1 to the full height for the horizontal-band
+      // (wipe) callers that only supply x.
+      const y0 = clip.y0 ?? 0;
+      const y1 = clip.y1 ?? canvasH;
+      gl.scissor(
+        Math.round(clip.x0),
+        Math.round(canvasH - y1),
+        Math.max(0, Math.round(clip.x1 - clip.x0)),
+        Math.max(0, Math.round(y1 - y0)),
+      );
     }
     gl.clearColor(0.15, 0.15, 0.15, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);

@@ -84,6 +84,7 @@
   // with the SPACE wholesale toggle (space exits wipe). `wipeT` is the
   // divider position as a fraction of canvas width.
   let wipeActive = $state(false);
+  let splitActive = $state(false);
   let wipeT = $state(0.5);
   // $state: the `wipe-grab` class binding reads it reactively (unlike
   // `dragging`/`painting`, which only gate imperative handlers).
@@ -162,6 +163,7 @@
    * toggleWipe, and the space branch). */
   export function toggleRoiMode() {
     if (wipeActive) wipeActive = false;
+    splitActive = false;
     if (showHealed) showHealed = false;
     roiMode = !roiMode;
     if (roiMode) {
@@ -209,6 +211,7 @@
     lastFetchedThreshold = null;
     showHealed = false;
     wipeActive = false;
+    splitActive = false;
     wipeDragging = false;
     // Strokes themselves arrive per-frame via props and belong to App; only
     // the transient in-canvas brush mode resets here.
@@ -241,6 +244,7 @@
     if (!healedAvailable) {
       showHealed = false;
       wipeActive = false;
+      splitActive = false;
     }
   });
 
@@ -543,7 +547,28 @@
     if (!running) return; // stopped on unmount; do not re-arm the rAF loop
     if (renderer && needsFrame) {
       needsFrame = false;
-      if (wipeActive) {
+      if (splitActive) {
+        // Split compare (default): original top, healed bottom, fixed divider.
+        const mid = Math.round(canvas.height / 2);
+        renderer.draw(tilePaths(false), canvas.width, canvas.height, overlay, {
+          x0: 0,
+          x1: canvas.width,
+          y0: 0,
+          y1: mid,
+        });
+        renderer.draw(tilePaths(true), canvas.width, canvas.height, overlay, {
+          x0: 0,
+          x1: canvas.width,
+          y0: mid,
+          y1: canvas.height,
+        });
+        renderer.drawStrokes(
+          [{ ax: 0, ay: mid, bx: canvas.width, by: mid, r: 1.5 }],
+          [1.0, 1.0, 1.0, 0.9],
+          canvas.width,
+          canvas.height,
+        );
+      } else if (wipeActive) {
         // Original left of the divider, healed right; each pass clears and
         // draws only its own scissored band, then a thin line marks the
         // divider itself.
@@ -623,7 +648,7 @@
       // side, and strokes painted across the divider would obscure it.
       // Strokes and the ROI affordances only render while the overlay is on:
       // with it off, show just the processed image (m toggles the overlay).
-      if (overlay.enabled && !showHealed && !wipeActive) {
+      if (overlay.enabled && !showHealed && !wipeActive && !splitActive) {
         const allStrokes =
           painting && livePoints.length > 0
             ? [
@@ -708,6 +733,7 @@
     // can't both own the canvas, so turning the brush on drops the wipe.
     // The ROI draw owns the pointer gesture the same way, so it drops too.
     if (wipeActive) wipeActive = false;
+    splitActive = false;
     if (roiMode) roiMode = false;
     const turningOn = brushMode === "off";
     brushMode = brushMode === mode ? "off" : mode;
@@ -721,14 +747,22 @@
   // Shared by the `c` key and the Compare button. No-op without healed
   // tiles to show. Turning the wipe on clears the brush and the wholesale
   // (space) toggle, which both contend for the same canvas.
-  function toggleWipe() {
+  function toggleCompare() {
     if (!healedAvailable) return;
-    wipeActive = !wipeActive;
-    if (wipeActive) {
-      showHealed = false;
-      brushMode = "off";
-      roiMode = false;
+    // Cycle: off -> split (default compare, original top / healed bottom) ->
+    // wipe (draggable left/right divider) -> off.
+    if (!splitActive && !wipeActive) {
+      splitActive = true;
+      wipeActive = false;
+    } else if (splitActive) {
+      splitActive = false;
+      wipeActive = true;
+    } else {
+      wipeActive = false;
     }
+    showHealed = false;
+    brushMode = "off";
+    roiMode = false;
     requestFrame();
   }
 
@@ -853,6 +887,7 @@
           // Space is the wholesale toggle; leaving the wipe first keeps the
           // two compare modes from stacking confusingly.
           wipeActive = false;
+          splitActive = false;
           showHealed = false;
         } else {
           // The healed view is for inspecting the RESULT; a box-draw
@@ -866,7 +901,7 @@
     } else if (e.key === "c") {
       if (healedAvailable) {
         e.preventDefault();
-        toggleWipe();
+        toggleCompare();
       }
       return;
     } else if (e.key === "b" || e.key === "e") {
@@ -1130,7 +1165,7 @@
           aria-pressed={wipeActive}
           disabled={!healedAvailable}
           onclick={() => {
-            toggleWipe();
+            toggleCompare();
             canvas.focus();
           }}><Icon name="compare" /> Compare</button
         >
