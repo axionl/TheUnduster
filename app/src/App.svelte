@@ -1620,6 +1620,23 @@
     return formatModelProgress(modelReceived, modelTotal);
   }
 
+  /** Let the operator load their own ONNX inpainting model from disk. The
+   * default LaMa model stays until an explicit choice replaces it. */
+  async function loadModelFile() {
+    try {
+      const path = await open({
+        filters: [{ name: "ONNX Model", extensions: ["onnx"] }],
+        title: "Open inpainting model",
+      });
+      if (typeof path !== "string" || !path) return;
+      await invoke("load_inpainter", { path });
+      modelStatus = "loaded";
+      pushInfo(`Model loaded: ${path.split(/[\\/]/).pop()}`);
+    } catch (e) {
+      pushError(String(e));
+    }
+  }
+
   async function cancelModelDownload() {
     modelCancelRequested = true;
     try {
@@ -2197,6 +2214,16 @@
         {/if}
       </div>
     {/if}
+    <!-- Load a custom inpainting model (default LaMa stays until replaced) -->
+    <div class="toolbar-group">
+      <button
+        class="btn"
+        title="Open a custom ONNX inpainting model file"
+        onclick={loadModelFile}
+      >
+        <Icon name="download" /> {t("loadModel")}
+      </button>
+    </div>
     <!-- Language switch: English / 中文 -->
     <div class="toolbar-group lang-group">
       <button

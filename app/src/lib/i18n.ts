@@ -36,6 +36,7 @@ const en: Dict = {
   downloadRealModel: "Download real healing model (207 MB)",
   cancel: "Cancel",
   cancelling: "Cancelling",
+  loadModel: "Load Model",
   // Empty state
   noScanOpen: "no scan open",
   dropHint: "or drop a scan or a roll folder anywhere in this window",
@@ -91,6 +92,7 @@ const zh: Dict = {
   downloadRealModel: "下载真实修复模型（207 MB）",
   cancel: "取消",
   cancelling: "取消中",
+  loadModel: "加载模型",
   noScanOpen: "未打开扫描",
   dropHint: "或把扫描/胶卷文件夹拖到窗口任意位置",
   autoInvert: "自动反相",
