@@ -80,12 +80,33 @@ fn planes_for(img: &ImageBuf, in_ch: usize) -> Vec<Vec<f32>> {
         let g = img.to_f32();
         vec![g.clone(), g.clone(), g]
     } else {
-        let f = img.to_f32();
+        // RGB straight from the native pixels, the same streaming shape as
+        // to_gray_f32: going through to_f32 first materializes an
+        // interleaved f32 copy of the whole image (2 GB for a 168MP scan)
+        // only to immediately de-interleave it, and that transient spike
+        // stacks with the ORT session peak and the two accumulator arrays
+        // to push the app past the OS memory watchdog on real color rolls
+        // -- the exact failure class to_gray_f32's comment documents.
+        // Normalization and operation order are identical to the
+        // to_f32-based de-interleave (same per-channel division, same
+        // channel order), so the planes stay bit-for-bit the same (pinned
+        // by rgb_planes_match_to_f32_reference_u8_and_u16).
         let n = (img.width * img.height) as usize;
         let mut planes = vec![vec![0f32; n]; 3];
-        for i in 0..n {
-            for (c, plane) in planes.iter_mut().enumerate() {
-                plane[i] = f[i * 3 + c];
+        match &img.data {
+            fd_io::PixelData::U8(v) => {
+                for (i, p) in v.chunks_exact(3).enumerate() {
+                    planes[0][i] = p[0] as f32 / 255.0;
+                    planes[1][i] = p[1] as f32 / 255.0;
+                    planes[2][i] = p[2] as f32 / 255.0;
+                }
+            }
+            fd_io::PixelData::U16(v) => {
+                for (i, p) in v.chunks_exact(3).enumerate() {
+                    planes[0][i] = p[0] as f32 / 65535.0;
+                    planes[1][i] = p[1] as f32 / 65535.0;
+                    planes[2][i] = p[2] as f32 / 65535.0;
+                }
             }
         }
         planes
@@ -186,13 +207,26 @@ impl Detector {
         let (w, h) = (img.width as usize, img.height as usize);
         let stride = TILE - OVERLAP;
         let mut acc = vec![0f32; w * h];
-        let mut weight = vec![0f32; w * h];
+        // Overlap-count accumulator, u8 not f32: tiles stride by
+        // TILE - OVERLAP with 64px overlap, so any pixel sits in at most a
+        // 2x2 block of tiles (count <= 4; edge-replicate padding adds no
+        // tiles). A full-width f32 weight array is 672MB of pure waste on a
+        // 168MP frame -- u8 keeps the exact same average with 1/4 the bytes
+        // (the final division casts back, and counts are exact small
+        // integers, so results are bit-identical).
+        let mut weight = vec![0u8; w * h];
 
         // Counted with the identical start/break arithmetic as the tiling
         // loop below (isomorphic, not reimplemented from scratch), so this
         // can never drift from the actual number of tiles the loop visits.
         let total = tile_start_count(h, stride) * tile_start_count(w, stride);
         let mut done = 0usize;
+
+        // Allocated once, overwritten in place per tile: every cell is
+        // written by the plane copy below, so the buffer never needs
+        // re-zeroing. (Previously a fresh Array4::zeros per tile -- ~870
+        // 3MB allocations on a 168MP frame, pure churn.)
+        let mut tile = Array4::<f32>::zeros((1, self.in_ch, TILE, TILE));
 
         let mut y0 = 0usize;
         loop {
@@ -203,7 +237,6 @@ impl Detector {
                 // Edge-replicate padded TILE x TILE tensor; replication clamps
                 // into the cropped tile's own extent, matching numpy's
                 // np.pad(tile, mode="edge") on the crop.
-                let mut tile = Array4::<f32>::zeros((1, self.in_ch, TILE, TILE));
                 for (c, plane) in planes.iter().enumerate() {
                     for ty in 0..TILE {
                         let sy = (y0 + ty).min(y1 - 1);
@@ -228,7 +261,7 @@ impl Detector {
                         let p = 1.0 / (1.0 + (-l).exp());
                         let idx = (y0 + ty) * w + (x0 + tx);
                         acc[idx] += p;
-                        weight[idx] += 1.0;
+                        weight[idx] += 1u8;
                     }
                 }
                 done += 1;
@@ -246,7 +279,7 @@ impl Detector {
             y0 += stride;
         }
         for i in 0..acc.len() {
-            acc[i] /= weight[i];
+            acc[i] /= weight[i] as f32;
         }
         Ok(acc)
     }
@@ -328,5 +361,42 @@ mod tests {
             exif: None,
         };
         assert_eq!(to_gray_f32(&img), img.to_f32());
+    }
+
+    /// The streaming RGB path must be bit-identical to the reference
+    /// to_f32 + de-interleave it replaced (same per-channel normalization,
+    /// same channel order) -- planes feed the detector, so even 1-ulp drift
+    /// would move defect boundaries between releases. Pins the optimization
+    /// documented on `planes_for`: eliminating the 2GB interleaved f32
+    /// intermediate must not change its output.
+    #[test]
+    fn rgb_planes_match_to_f32_reference_u8_and_u16() {
+        let (w, h) = (37u32, 23u32);
+        let n = (w * h) as usize;
+
+        let bytes = pseudo_random_bytes(n * 3);
+        let img8 = rgb_image(PixelData::U8(bytes.clone()), w, h);
+        let reference8: Vec<f32> = img8.to_f32();
+        let mut expected8 = vec![vec![0f32; n]; 3];
+        for i in 0..n {
+            for (c, plane) in expected8.iter_mut().enumerate() {
+                plane[i] = reference8[i * 3 + c];
+            }
+        }
+        assert_eq!(planes_for(&img8, 3), expected8);
+
+        let words: Vec<u16> = pseudo_random_bytes(n * 3)
+            .into_iter()
+            .map(|b| (b as u16) << 8 | 0x2f)
+            .collect();
+        let img16 = rgb_image(PixelData::U16(words.clone()), w, h);
+        let reference16: Vec<f32> = img16.to_f32();
+        let mut expected16 = vec![vec![0f32; n]; 3];
+        for i in 0..n {
+            for (c, plane) in expected16.iter_mut().enumerate() {
+                plane[i] = reference16[i * 3 + c];
+            }
+        }
+        assert_eq!(planes_for(&img16, 3), expected16);
     }
 }

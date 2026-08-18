@@ -11,13 +11,19 @@
     | "paint"
     | "erase"
     | "overlay"
-    | "compare";
+    | "compare"
+    | "undo"
+    | "redo"
+    | "roi"
+    | "clear";
 
   const paths: Record<IconName, string> = {
     scan: "M4 5h16v14H4z M4 9h16",
     roll: "M3 7h13v10H3z M16 10h5v4h-5z M6 7v10 M13 7v10",
     detect: "M11 4a7 7 0 1 0 0 14 a7 7 0 0 0 0-14 M16 16l4 4",
     heal: "M12 4v16 M4 12h16",
+    undo: "M9 14L4 9l5-5 M4 9h10a6 6 0 1 1 0 12H10",
+    redo: "M15 14l5-5-5-5 M20 9H10a6 6 0 1 0 0 12h3",
     // Up-and-out over a base line -- the mirror of download's down-into-a-
     // tray, so the two no longer differ by a single pixel of baseline y.
     export: "M12 14V4 M8 8l4-4 4 4 M5 18h14",
@@ -30,6 +36,10 @@
     // A framed image split down the middle -- the wipe divider between a
     // before and after half.
     compare: "M4 5h16v14H4z M12 5v14",
+    // Corner brackets framing a region -- the region-of-interest selector.
+    roi: "M4 8V5a1 1 0 0 1 1-1h3 M16 4h3a1 1 0 0 1 1 1v3 M20 16v3a1 1 0 0 1-1 1h-3 M8 20H5a1 1 0 0 1-1-1v-3",
+    // A framed region crossed out -- removing the region of interest.
+    clear: "M4 5h16v14H4z M8 8l8 8 M16 8l-8 8",
   };
 </script>
 

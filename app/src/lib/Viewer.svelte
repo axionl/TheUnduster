@@ -9,6 +9,8 @@
     stepRadius,
     pushStroke,
     chunkPoints,
+    MIN_RADIUS,
+    MAX_RADIUS,
     MAX_POINTS_PER_STROKE,
     MAX_STROKES,
     type StrokeData,
@@ -28,6 +30,10 @@
     threshold: number;
   }
 
+  /** Image-pixel ROI: inclusive endpoints [x0, y0, x1, y1]; `null` = whole
+   * image (no ROI). Stored/persisted as-is; see App's onRoiChange. */
+  type Roi = [number, number, number, number];
+
   let {
     info,
     overlay,
@@ -41,6 +47,8 @@
     onStrokesChange,
     onBrushLimit,
     onDetectionsChange,
+    roi = null,
+    onRoiChange,
   }: {
     info: ImageInfo;
     overlay: Overlay;
@@ -54,6 +62,8 @@
     onStrokesChange?: (strokes: StrokeData[], redo: StrokeData[]) => void;
     onBrushLimit?: (message: string) => void;
     onDetectionsChange?: (count: number) => void;
+    roi?: Roi | null;
+    onRoiChange?: (roi: Roi | null) => void;
   } = $props();
 
   let canvas: HTMLCanvasElement;
@@ -111,12 +121,66 @@
   let painting = false;
   let livePoints: [number, number][] = [];
 
+  // ROI box-selection mode: a pointer drag picks the region of interest that
+  // detections are computed/shown inside (everything outside it is excluded
+  // and dimmed). Exclusive with the brush and the wipe -- all three own the
+  // canvas's pointer gesture -- and with the wholesale showHealed toggle
+  // (see toggleRoiMode/toggleBrush/toggleWipe and the space branch). The
+  // in-progress drag corners are IMAGE px (pointer coords go through
+  // screenToImage), so a mid-drag pan/zoom keeps them anchored to the image.
+  let roiMode = $state(false);
+  let roiStart: [number, number] | null = null;
+  let roiCurrent: [number, number] | null = null;
+  let roiDragging = false;
+
   // Exposed to App (via bind:this) for its status line. Svelte 5 disallows
   // exporting a $derived value directly from a component; a getter function
   // is the supported instance-API shape, so App reads it each render.
   export function brushStatus(): string | null {
     if (brushMode === "off") return null;
     return `${brushMode === "paint" ? "brush" : "erase"} ${Math.round(brushRadius)}px`;
+  }
+
+  /** Instance-API getter for App's toolbar button (mirrors `brushStatus`):
+   * App reads it each render, so its active state tracks `roiMode` live. */
+  export function roiModeActive(): boolean {
+    return roiMode;
+  }
+
+  /** Toggles ROI box-selection mode. Shared by the r key branch and the
+   * toolbar's Set ROI button. Exclusive with the brush and the wipe: both
+   * own the canvas's pointer gesture, so entering the ROI draw drops them
+   * (and entering either from the ROI mode drops it -- see toggleBrush,
+   * toggleWipe, and the space branch). */
+  export function toggleRoiMode() {
+    if (wipeActive) wipeActive = false;
+    if (showHealed) showHealed = false;
+    roiMode = !roiMode;
+    if (roiMode) {
+      brushMode = "off";
+      // Drop any in-progress drag state from a previous session: the corners
+      // belong to a gesture that was interrupted, not to this new mode entry.
+      roiDragging = false;
+      roiStart = null;
+      roiCurrent = null;
+    }
+    requestFrame();
+  }
+
+  /** Normalizes two dragged image-space corners into a committed ROI: each
+   * coordinate is clamped to the image bounds (inclusive endpoints, rounded
+   * to integer pixels, the backend's [u32; 4] contract) and the corners are
+   * ordered so x0<=x1, y0<=y1. Returns null for a zero-area box -- a click
+   * without a drag is almost certainly an accident, and committing a 1x1 ROI
+   * that excludes the entire frame from detection would surprise more than
+   * doing nothing (callers keep the previous ROI in that case). */
+  function normalizeRoi(a: [number, number], b: [number, number]): Roi | null {
+    const x0 = Math.round(Math.min(Math.max(Math.min(a[0], b[0]), 0), info.width - 1));
+    const y0 = Math.round(Math.min(Math.max(Math.min(a[1], b[1]), 0), info.height - 1));
+    const x1 = Math.round(Math.min(Math.max(Math.max(a[0], b[0]), 0), info.width - 1));
+    const y1 = Math.round(Math.min(Math.max(Math.max(a[1], b[1]), 0), info.height - 1));
+    if (x0 === x1 && y0 === y1) return null;
+    return [x0, y0, x1, y1];
   }
 
   function requestFrame() {
@@ -146,6 +210,12 @@
     // geometry onto frame N+1.
     painting = false;
     livePoints = [];
+    // Same for an in-progress ROI drag: its corners are image px of the
+    // frame we just left, and the ROI mode itself is a transient gesture.
+    roiMode = false;
+    roiDragging = false;
+    roiStart = null;
+    roiCurrent = null;
     // A pending refresh belonged to the frame we just left; the new frame
     // hasn't scheduled one yet, so don't leave the rings dimmed for it.
     refreshPending = false;
@@ -166,9 +236,15 @@
     }
   });
 
-  export async function refreshDetections(threshold: number) {
+  export async function refreshDetections(threshold: number, roiOverride?: Roi | null) {
     try {
-      detections = await invoke("components", { id: info.id, threshold });
+      // `roiOverride` lets App pass the just-committed ROI explicitly: the
+      // `roi` prop may not have been flushed to this component yet when the
+      // caller is responding to its own onRoiChange commit (Svelte batches
+      // prop updates), and reading the stale prop would fetch boxes for the
+      // previous ROI.
+      const activeRoi = roiOverride === undefined ? roi : roiOverride;
+      detections = await invoke("components", { id: info.id, threshold, roi: activeRoi });
       // Only on success: a failed fetch (no probabilities yet) must not
       // report a count, so the status bar's fallback copy stays in charge.
       lastFetchedThreshold = threshold;
@@ -231,6 +307,14 @@
   // they land so ring markers appear without waiting for a pan or zoom.
   $effect(() => {
     void bboxes;
+    requestFrame();
+  });
+
+  // The ROI dim-out/outline is drawn in the rAF loop; redraw when the
+  // committed ROI changes (a local commit via onRoiChange, or a frame/roll
+  // switch delivering a different persisted ROI).
+  $effect(() => {
+    void roi;
     requestFrame();
   });
 
@@ -407,6 +491,46 @@
     );
   }
 
+  /** Image-space ROI -> device-px rect on the overlay canvas. Same projection
+   * as the tile/ring passes (`(x - centerX) * zoom + canvas.width / 2`), so
+   * the 2D overlay lines up with the WebGL frame under it at every zoom. */
+  /** Image-space ROI -> device-px rect on the main WebGL canvas, using the
+   * same `(x - centerX) * zoom + canvas.width/2` projection as the tile and
+   * ring passes so the ROI lines up with the frame under it at every zoom. */
+  function roiScreenRect(r: Roi) {
+    return {
+      x0: (r[0] - centerX) * zoom + canvas.width / 2,
+      y0: (r[1] - centerY) * zoom + canvas.height / 2,
+      x1: (r[2] - centerX) * zoom + canvas.width / 2,
+      y1: (r[3] - centerY) * zoom + canvas.height / 2,
+    };
+  }
+
+  /** Draws the ROI affordances (dim-out outside the box + amber outline) and
+   * the live drag preview onto the MAIN WebGL canvas via the renderer, in the
+   * same single-canvas pass as tiles/rings/strokes. */
+  function drawRoiToCanvas() {
+    if (!renderer) return;
+    const w = canvas.width;
+    const h = canvas.height;
+    if (roi) {
+      renderer.drawRoi(roiScreenRect(roi), w, h, true);
+    }
+    if (roiMode && roiDragging && roiStart && roiCurrent) {
+      renderer.drawRoi(
+        roiScreenRect([
+          Math.min(roiStart[0], roiCurrent[0]),
+          Math.min(roiStart[1], roiCurrent[1]),
+          Math.max(roiStart[0], roiCurrent[0]),
+          Math.max(roiStart[1], roiCurrent[1]),
+        ]),
+        w,
+        h,
+        false, // preview: outline only, no dim-out
+      );
+    }
+  }
+
   function frame() {
     if (!running) return; // stopped on unmount; do not re-arm the rAF loop
     if (renderer && needsFrame) {
@@ -516,6 +640,11 @@
           );
         }
       }
+      // The ROI dim-out/outline and live draw preview are drawn on the same
+      // WebGL canvas as the image itself (not a stacked 2D canvas, which
+      // breaks the WebGL surface in WKWebView), so they repaint together with
+      // the frame each rAF cycle.
+      drawRoiToCanvas();
     }
     rafId = requestAnimationFrame(frame);
   }
@@ -567,7 +696,9 @@
   function toggleBrush(mode: "paint" | "erase") {
     // Brushing annotates the BEFORE state; the wipe shows the AFTER. They
     // can't both own the canvas, so turning the brush on drops the wipe.
+    // The ROI draw owns the pointer gesture the same way, so it drops too.
     if (wipeActive) wipeActive = false;
+    if (roiMode) roiMode = false;
     const turningOn = brushMode === "off";
     brushMode = brushMode === mode ? "off" : mode;
     if (turningOn && brushMode !== "off") {
@@ -586,6 +717,7 @@
     if (wipeActive) {
       showHealed = false;
       brushMode = "off";
+      roiMode = false;
     }
     requestFrame();
   }
@@ -605,6 +737,23 @@
   }
 
   function onPointerMove(e: PointerEvent) {
+    // Live ROI drag preview: update the far corner in image px. Mutually
+    // exclusive with wipe/brush/pan (roiMode drops them on entry), so this
+    // branch never needs to consult them.
+    if (roiDragging && roiStart) {
+      const dpr = window.devicePixelRatio || 1;
+      roiCurrent = screenToImage(
+        e.offsetX * dpr,
+        e.offsetY * dpr,
+        zoom,
+        centerX,
+        centerY,
+        canvas.width,
+        canvas.height,
+      );
+      requestFrame();
+      return;
+    }
     if (wipeDragging) {
       const dpr = window.devicePixelRatio || 1;
       // Clamped a hair inside the edges so the divider can always be
@@ -696,6 +845,9 @@
           wipeActive = false;
           showHealed = false;
         } else {
+          // The healed view is for inspecting the RESULT; a box-draw
+          // interaction has no meaning there, so drop ROI mode with it.
+          if (roiMode) roiMode = false;
           showHealed = !showHealed;
         }
         requestFrame();
@@ -711,9 +863,17 @@
       e.preventDefault();
       toggleBrush(e.key === "b" ? "paint" : "erase");
       return;
-    } else if (e.key === "Escape" && brushMode !== "off") {
+    } else if (e.key === "r") {
+      e.preventDefault();
+      toggleRoiMode();
+      return;
+    } else if (e.key === "Escape" && (brushMode !== "off" || roiMode)) {
       e.preventDefault();
       brushMode = "off";
+      roiMode = false;
+      roiDragging = false;
+      roiStart = null;
+      roiCurrent = null;
       requestFrame();
       return;
     } else if ((e.key === "[" || e.key === "]") && brushMode !== "off") {
@@ -755,14 +915,10 @@
 
   onMount(() => {
     const dpr = window.devicePixelRatio || 1;
-    const resize = () => {
-      canvas.width = canvas.clientWidth * dpr;
-      canvas.height = canvas.clientHeight * dpr;
-      requestFrame();
-    };
-    resize();
-    const ro = new ResizeObserver(resize);
-    ro.observe(canvas);
+    // Create the WebGL renderer BEFORE the first resize: a resize that
+    // touches the (optional) ROI overlay must never be able to prevent the
+    // image renderer from initializing. If anything below throws, the image
+    // canvas already has a working renderer and will still draw.
     try {
       renderer = new TileRenderer(canvas);
     } catch (e) {
@@ -772,6 +928,14 @@
       glError = String(e);
       throw e;
     }
+    const resize = () => {
+      canvas.width = canvas.clientWidth * dpr;
+      canvas.height = canvas.clientHeight * dpr;
+      requestFrame();
+    };
+    resize();
+    const ro = new ResizeObserver(resize);
+    ro.observe(canvas);
     renderer.onTileLoaded = requestFrame;
     zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
     requestFrame();
@@ -804,13 +968,34 @@
   <canvas
     bind:this={canvas}
     role="application"
-    aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, delete or backspace removes the selected defect, h heals, space toggles before and after, c toggles the wipe compare and its divider drags, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
+    aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, delete or backspace removes the selected defect, h heals, space toggles before and after, c toggles the wipe compare and its divider drags, b paints, e erases, r draws a region of interest, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
     tabindex="0"
     class:brushing={brushMode !== "off" && !showHealed}
     class:wipe-grab={(wipeHover || wipeDragging) && brushMode === "off"}
+    class:roi-mode={roiMode}
     onwheel={onWheel}
     onpointerdown={(e) => {
       canvas.setPointerCapture(e.pointerId);
+      if (roiMode) {
+        // Compute from the event directly, same as the brush branch below:
+        // a pointerdown with no preceding pointermove would otherwise start
+        // the box at the stale (0,0) init value.
+        const dpr = window.devicePixelRatio || 1;
+        const [ix, iy] = screenToImage(
+          e.offsetX * dpr,
+          e.offsetY * dpr,
+          zoom,
+          centerX,
+          centerY,
+          canvas.width,
+          canvas.height,
+        );
+        roiStart = [ix, iy];
+        roiCurrent = [ix, iy];
+        roiDragging = true;
+        requestFrame();
+        return;
+      }
       if (wipeActive) {
         const dpr = window.devicePixelRatio || 1;
         const x = e.offsetX * dpr;
@@ -846,6 +1031,28 @@
       dragging = true;
     }}
     onpointerup={() => {
+      if (roiDragging) {
+        roiDragging = false;
+        const start = roiStart;
+        const end = roiCurrent;
+        roiStart = null;
+        roiCurrent = null;
+        if (start && end) {
+          const committed = normalizeRoi(start, end);
+          if (committed) {
+            // A successful box: leave the draw mode so the next gesture is
+            // a normal pan again, then hand the ROI to App to persist and
+            // recompute detections.
+            roiMode = false;
+            onRoiChange?.(committed);
+          }
+          // A zero-area box (plain click, no drag) cancels the draw and
+          // keeps the previous ROI -- and stays in ROI mode so the operator
+          // can immediately retry without re-entering.
+        }
+        requestFrame();
+        return;
+      }
       dragging = false;
       wipeDragging = false;
       if (painting) {
@@ -860,6 +1067,12 @@
       wipeDragging = false;
       painting = false;
       livePoints = [];
+      // The drag was interrupted (pointer left the window, capture lost);
+      // drop the box. The mode itself survives so the operator can retry.
+      roiDragging = false;
+      roiStart = null;
+      roiCurrent = null;
+      requestFrame();
     }}
     onpointermove={onPointerMove}
     onkeydown={onKey}
@@ -912,7 +1125,17 @@
           }}><Icon name="compare" /> Compare</button
         >
         {#if brushMode !== "off"}
-          <span class="radius-readout">{brushRadius}px</span>
+          <label class="brush-size" title="Brush size">
+            <input
+              type="range"
+              min={MIN_RADIUS}
+              max={MAX_RADIUS}
+              step="1"
+              bind:value={brushRadius}
+              aria-label="Brush size"
+            />
+            <span class="radius-readout">{brushRadius}px</span>
+          </label>
         {/if}
     </div>
     <div class="palette zoom-palette">
@@ -945,6 +1168,9 @@
   canvas.wipe-grab {
     cursor: ew-resize;
   }
+  canvas.roi-mode {
+    cursor: crosshair;
+  }
   .palette {
     position: absolute;
     bottom: var(--space-3);
@@ -975,6 +1201,14 @@
     font-size: var(--text-sm);
     color: var(--text-2);
     font-variant-numeric: tabular-nums;
+  }
+  .brush-size {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+  .brush-size input[type="range"] {
+    width: 90px;
   }
   .gl-error {
     color: var(--err);

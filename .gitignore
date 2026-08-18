@@ -4,6 +4,8 @@ app/node_modules/
 app/dist/
 app/build/
 app/src-tauri/target/
+# DMG / bundling output at the repo root
+/dist/
 
 # Python / training
 training/.venv/

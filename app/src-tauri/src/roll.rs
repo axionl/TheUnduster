@@ -25,6 +25,15 @@ pub struct Frame {
     pub defect_count: Option<usize>,
     #[serde(default)]
     pub bboxes: Option<Vec<[u32; 4]>>,
+    /// Region of interest in image-pixel coordinates `[x0, y0, x1, y1]`
+    /// (inclusive). Defect detection/boxes are restricted to this rectangle,
+    /// so scan-edge black bars / borders -- which the tiled detector's
+    /// edge-replicate padding reliably misreads as defects -- can be excluded
+    /// by the operator instead of driving the sensitivity slider to 0.95.
+    /// `None` = whole image. Serialized to the sidecar; `reset_decisions`
+    /// clears it alongside the other operator inputs.
+    #[serde(default)]
+    pub roi: Option<[u32; 4]>,
     #[serde(default)]
     pub strokes: Vec<crate::masks::Stroke>,
     #[serde(default)]
@@ -57,6 +66,7 @@ impl Frame {
             exported: false,
             defect_count: None,
             bboxes: None,
+            roi: None,
             strokes: Vec::new(),
             redo_strokes: Vec::new(),
             export_provenance: None,
@@ -338,6 +348,18 @@ pub struct PendingSave {
 /// Named to keep that function's signature clippy-clean (`type_complexity`).
 pub type FrameMeta = (String, f32, Vec<crate::masks::Stroke>);
 
+/// `(path, file_name, threshold, roi, strokes)` -- everything the transient
+/// export pipeline and the job worker need about a frame in one atomic read
+/// (`RollState::export_frame_meta`). Named alias keeps the signature readable
+/// and satisfies clippy::type_complexity.
+pub type ExportFrameMeta = (
+    PathBuf,
+    String,
+    f32,
+    Option<[u32; 4]>,
+    Vec<crate::masks::Stroke>,
+);
+
 /// One approved frame's export-decision inputs, returned by
 /// `RollState::approved_export_snapshot`: everything `enqueue_exports`
 /// needs to compute the frame's current heal provenance (threshold,
@@ -362,6 +384,7 @@ pub struct FrameInfo {
     pub exported: bool,
     pub defect_count: Option<usize>,
     pub bboxes: Option<Vec<[u32; 4]>>,
+    pub roi: Option<[u32; 4]>,
     pub strokes: Vec<crate::masks::Stroke>,
     pub redo_strokes: Vec<crate::masks::Stroke>,
 }
@@ -376,6 +399,7 @@ impl Frame {
             exported: self.exported,
             defect_count: self.defect_count,
             bboxes: self.bboxes.clone(),
+            roi: self.roi,
             strokes: self.strokes.clone(),
             redo_strokes: self.redo_strokes.clone(),
         }
@@ -724,16 +748,14 @@ impl RollState {
         Ok(roll.dir.join(&frame.file_name))
     }
 
-    /// Path, file name, stored threshold, and strokes for a frame, read under
-    /// a single lock acquisition: the transient export pipeline needs all four
-    /// together (path to decode, file name to name the destination file,
-    /// threshold to build the mask, strokes to apply), and reading them
-    /// separately would risk observing an inconsistent frame across two lock
-    /// windows.
-    pub fn export_frame_meta(
-        &self,
-        index: usize,
-    ) -> Result<(PathBuf, String, f32, Vec<crate::masks::Stroke>), String> {
+    /// Path, file name, stored threshold, ROI, and strokes for a frame, read
+    /// under a single lock acquisition: the transient export pipeline and the
+    /// heal/detect job worker need all of them together (path to decode, file
+    /// name to name the destination file, threshold to build the mask, ROI to
+    /// restrict heal/detect to the region of interest, strokes to apply), and
+    /// reading them separately would risk observing an inconsistent frame
+    /// across two lock windows.
+    pub fn export_frame_meta(&self, index: usize) -> Result<ExportFrameMeta, String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
         let frame = roll
@@ -744,6 +766,7 @@ impl RollState {
             roll.dir.join(&frame.file_name),
             frame.file_name.clone(),
             frame.threshold,
+            frame.roi,
             frame.strokes.clone(),
         ))
     }
@@ -795,6 +818,46 @@ impl RollState {
             .get_mut(index)
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.threshold = threshold;
+        frame.defect_count = count;
+        frame.bboxes = bboxes;
+        let pending = self.snapshot_sidecar(roll)?;
+        drop(guard); // the disk write below must not hold the roll lock
+        self.commit_sidecar(pending)?;
+        Ok(true)
+    }
+
+    /// Sets a frame's ROI together with the recomputed component count and
+    /// boxes (recomputed WITH the ROI applied, so the operator sees the
+    /// edge-exclusion take effect immediately), in one sidecar write. The
+    /// ROI-inclusive recompute pairs this setter with the sensitivity slider
+    /// (`set_threshold_and_components`) -- both are post-detect walks over
+    /// cached probabilities, and both must apply the current ROI. Mirrors
+    /// that setter's shape (generation re-check under the lock, discard
+    /// returned as `Ok(false)` on a lost race) so a ROI drawn right as the
+    /// roll swaps never lands in the wrong sidecar.
+    pub fn set_frame_roi_and_components(
+        &self,
+        generation: u64,
+        index: usize,
+        roi: Option<[u32; 4]>,
+        count: Option<usize>,
+        bboxes: Option<Vec<[u32; 4]>>,
+    ) -> Result<bool, String> {
+        if let Some([x0, y0, x1, y1]) = roi {
+            if x0 > x1 || y0 > y1 {
+                return Err(format!("roi must satisfy x0<=x1 and y0<=y1, got {roi:?}"));
+            }
+        }
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Ok(false);
+        }
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.roi = roi;
         frame.defect_count = count;
         frame.bboxes = bboxes;
         let pending = self.snapshot_sidecar(roll)?;
@@ -1001,6 +1064,7 @@ impl RollState {
             frame.approved = false;
             frame.exported = false;
             frame.export_provenance = None;
+            frame.roi = None;
             frame.strokes = Vec::new();
             frame.redo_strokes = Vec::new();
         }
@@ -1713,7 +1777,8 @@ mod state_tests {
             points: vec![[1.0, 1.0]],
         }];
         state.set_strokes(0, strokes.clone(), vec![]).unwrap();
-        let (_, _, _, meta_strokes) = state.export_frame_meta(0).unwrap();
+        let (_, _, _, meta_roi, meta_strokes) = state.export_frame_meta(0).unwrap();
+        assert_eq!(meta_roi, None);
         assert_eq!(meta_strokes, strokes);
     }
 

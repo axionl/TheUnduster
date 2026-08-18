@@ -267,10 +267,25 @@ async fn run_download(app: &tauri::AppHandle, inpainter: &InpainterState) -> Res
     let tmp = lama_tmp_path(app)?;
     let final_path = lama_path(app)?;
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_STALL_SECS))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_STALL_SECS));
+    // Route the model download through a local HTTP proxy when one is
+    // configured. This app's reqwest build has `default-features = false`
+    // (no system-proxy), so env proxies are NOT read automatically; a user
+    // behind a firewall (e.g. Hugging Face blocked) sets `UNDUSTER_PROXY`
+    // (or HTTPS_PROXY/HTTP_PROXY) to e.g. `http://127.0.0.1:7890` and the
+    // download works. `Proxy::all` covers http/https.
+    let proxy_env = std::env::var("UNDUSTER_PROXY")
+        .or_else(|_| std::env::var("HTTPS_PROXY"))
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    if let Some(proxy) = proxy_env {
+        if let Ok(p) = reqwest::Proxy::all(proxy.trim()) {
+            builder = builder.proxy(p);
+        }
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
     let response = client
         .get(LAMA_URL)
         .send()

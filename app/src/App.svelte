@@ -4,6 +4,7 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { confirm, open, save } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
+  import GradePanel from "./lib/GradePanel.svelte";
   import Icon from "./lib/Icon.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
   import StatusBar from "./lib/StatusBar.svelte";
@@ -50,6 +51,9 @@
     approved: boolean;
     exported: boolean;
     defect_count: number | null;
+    // Image-pixel region of interest [x0, y0, x1, y1] (inclusive endpoints),
+    // persisted per frame by the sidecar; null = no ROI (whole image).
+    roi: [number, number, number, number] | null;
     bboxes: [number, number, number, number][] | null;
     strokes: StrokeData[];
     redo_strokes: StrokeData[];
@@ -116,7 +120,14 @@
   let loading: string | null = $state(null);
   let viewer: Viewer | undefined = $state();
   let overlay = $state({ enabled: true, threshold: 0.5 });
+  // Which workflow tab is active: `grade` = color grading, `clean` = dust
+  // removal (the classic Viewer). Flow: import -> grade -> clean -> export.
+  let gradeTab = $state(false);
   let detected = $state(false);
+  // Single-image mode only: the ROI is session-local there (roll frames carry
+  // theirs in roll.frames[i].roi, persisted to the sidecar by
+  // set_frame_roi). Reset on every open; see `currentRoi` for the merge.
+  let singleRoi: [number, number, number, number] | null = $state(null);
   // Live defect count at the current slider threshold, fed by the Viewer's
   // `onDetectionsChange` callback once probabilities exist (either via probe
   // or a real detect run). Distinct from the roll's persisted
@@ -992,11 +1003,15 @@
       : null;
     detected = false;
     liveDefectCount = null;
+    // A freshly opened single image starts with no ROI: it's session-local
+    // in single-image mode (see `singleRoi`), so a previous scan's box must
+    // not leak onto this one.
+    singleRoi = null;
     // A freshly opened single image is a brand-new registry entry, so this
     // will normally miss (no cached probs to find) -- kept for symmetry with
     // `activateCurrentFrame` and to stay correct if the registry ever learns
     // to reuse ids for reopened files.
-    probeDetected(info.id);
+    probeDetected(info.id, null);
     if (previousId !== undefined) {
       try {
         await invoke("close_image", { id: previousId });
@@ -1156,7 +1171,7 @@
    * stale-guarded against `id` (captured before each await) so a fast
    * frame-to-frame flip can never apply a late probe's result to the wrong
    * frame. */
-  function probeDetected(id: number) {
+  function probeDetected(id: number, roi: [number, number, number, number] | null) {
     async function attempt(): Promise<boolean> {
       // Captured ONCE, before the await: these boxes are the answer for THIS
       // threshold. Reading overlay.threshold again after the await would,
@@ -1165,12 +1180,15 @@
       // equality check would then suppress the corrective refetch forever.
       // Recording the true fetch threshold keeps that check honest: a
       // mid-await slider move leaves it different from the live threshold,
-      // so the effect refetches as it should.
+      // so the effect refetches as it should. `roi` is captured the same way
+      // for the same reason: a mid-probe ROI commit must not let the probe's
+      // boxes (computed against the pre-commit ROI) win the race.
       const threshold = overlay.threshold;
       try {
         const components = await invoke<[number, number, number, number][]>("components", {
           id,
           threshold,
+          roi,
         });
         if (info?.id !== id) return true; // stale: a newer frame is active, but not a miss
         // Fill the Viewer's live detections BEFORE flipping `detected`:
@@ -1273,6 +1291,11 @@
     // instead of the persisted values the cached heal actually matched.
     const persistedThreshold = roll.frames[index].threshold;
     const persistedStrokeCount = roll.frames[index].strokes.length;
+    // Same snapshot-for-the-restore-case discipline as persistedThreshold:
+    // the probe below fetches boxes WITH the ROI applied, and it must use
+    // the ROI the frame was persisted under, not whatever the operator
+    // draws while the activation await is in flight.
+    const persistedRoi = roll.frames[index].roi;
     // Captured now, schedule-time, same shape as the threshold-save debounce:
     // the backend re-checks this against the live roll under the same lock
     // that registers the decoded image, so a decode that finishes after a
@@ -1332,8 +1355,9 @@
     // fire-and-forget restore. Probe for them so rings/z-cycling/the status
     // count switch to live detections without the operator ever pressing
     // Detect; `probeDetected` no-ops (leaves the stored-bbox fallback) when
-    // none exist.
-    probeDetected(result.id);
+    // none exist. `persistedRoi` (snapshotted before the await) keeps the
+    // probe's `components` call ROI-consistent with the frame being probed.
+    probeDetected(result.id, persistedRoi);
     // Same reasoning as the probs probe above, for the heal cache: an
     // evicted-then-reactivated frame's registry `healed` flag was reset by
     // the eviction, but its on-disk heal cache (if any) still matches --
@@ -1532,11 +1556,10 @@
       return;
     }
     // Single-image mode only from here on (the roll branch above always
-    // returns): healing needs live probabilities computed for this session.
-    if (!detected) {
-      pushError("Run detection before healing");
-      return;
-    }
+    // returns). The backend heals with whatever it has: detected
+    // probabilities when present (masked by `healThreshold`), plus the
+    // operator's manual strokes. Painted defects heal directly even before
+    // a detect has run -- no detection required.
     healing = true;
     healProgress = null;
     // Snapshot BEFORE the await: the slider and brush stay live during a
@@ -1548,6 +1571,7 @@
       await invoke("heal_frame", {
         id: info.id,
         threshold: healThreshold,
+        roi: currentRoi,
         strokes: healStrokes,
       });
       const key = strokeKey();
@@ -1620,6 +1644,24 @@
     const key = strokeKey();
     return key ? (strokeStore[key]?.redo ?? []) : [];
   }
+
+  // The ROI for the frame actually on screen: roll frames carry theirs in
+  // the sidecar-backed frame object; single-image mode keeps it in
+  // `singleRoi`. Keyed off `displayedIndex`, matching `strokeKey()`: during
+  // the activation window the OLD frame is still on screen and the overlay
+  // must keep showing that frame's ROI (and not the new frame's, which would
+  // sit misaligned over the old pixels). `roll` is snapshotted into a local
+  // const first -- TS's narrowing of the $state-declared `roll` doesn't
+  // survive inside `$derived` expressions (same pattern as statusLeft).
+  const currentRoi = $derived.by(() => {
+    const r = roll;
+    if (!r) return singleRoi;
+    return r.frames[displayedIndex]?.roi ?? null;
+  });
+  // Live read of the Viewer's ROI-mode state for the toolbar button (same
+  // pattern as `brushStatus` in statusLeft): `roiModeActive()` reads the
+  // Viewer's $state, so this derived re-evaluates when the mode toggles.
+  const roiModeActive = $derived(viewer?.roiModeActive() ?? false);
 
   // True when the displayed frame's heal no longer matches its inputs:
   // the threshold has moved or the stroke count has changed since the heal
@@ -1747,6 +1789,28 @@
     }
   }
 
+  // Toolbar Undo/Redo. Same code path as the window-level cmd-z / shift-cmd-z
+  // handler (undoStroke/redoStroke + onStrokesChange), just triggered by a
+  // button click instead of a keypress, so the two stay behaviorally
+  // identical -- one undo stack, one persist path.
+  function undoBrushStroke() {
+    const key = strokeKey();
+    if (!key) return;
+    const before = strokeStore[key] ?? { strokes: [], redo: [] };
+    const result = undoStroke(before.strokes, before.redo);
+    if (result.strokes === before.strokes && result.redo === before.redo) return;
+    onStrokesChange(result.strokes, result.redo);
+  }
+
+  function redoBrushStroke() {
+    const key = strokeKey();
+    if (!key) return;
+    const before = strokeStore[key] ?? { strokes: [], redo: [] };
+    const result = redoStroke(before.strokes, before.redo);
+    if (result.strokes === before.strokes && result.redo === before.redo) return;
+    onStrokesChange(result.strokes, result.redo);
+  }
+
   function onStrokesChange(strokes: StrokeData[], redo: StrokeData[]) {
     const key = strokeKey();
     if (!key) return;
@@ -1776,6 +1840,52 @@
           pushError(String(e));
         });
     }
+  }
+
+  /** Commits a drawn or cleared ROI (the Viewer's onRoiChange). Roll mode
+   * persists via `set_frame_roi` and mirrors onThresholdInput's shape --
+   * roll identity captured NOW, generation re-checked after the await, stale
+   * writes dropped -- then refreshes the bbox list so the rings immediately
+   * reflect the new ROI. Single-image mode keeps the ROI session-local
+   * (`singleRoi`) and just re-fetches components with it. */
+  async function onRoiChange(roi: [number, number, number, number] | null) {
+    if (roll) {
+      // Captured before the await, same as onThresholdInput: the operator
+      // can navigate or swap rolls while the invoke is in flight, and the
+      // invoke must persist against the frame it was scheduled for. Mirrors
+      // the threshold save's `currentIndex` choice (not `displayedIndex`).
+      const index = currentIndex;
+      const generation = rollGeneration;
+      const threshold = overlay.threshold;
+      try {
+        // Returns the recomputed defect count at the current threshold with
+        // the ROI applied (null = no resident probabilities to recompute
+        // from). The bbox list itself is refetched below via `components`.
+        const count = await invoke<number | null>("set_frame_roi", {
+          index,
+          roi,
+          generation,
+          threshold,
+        });
+        if (!roll || generation !== rollGeneration) return; // stale: roll swapped
+        const frame = roll.frames[index];
+        if (frame === undefined) return;
+        frame.roi = roi;
+        if (count !== null) frame.defect_count = count;
+        // Refresh the rings for the new ROI. `roi` is passed explicitly
+        // (Viewer's roiOverride) because the `roi` prop may not have flushed
+        // to the Viewer yet from the frame.roi write above.
+        await viewer?.refreshDetections(threshold, roi);
+        probeHealedCached(index);
+      } catch (e) {
+        pushError(String(e));
+      }
+      return;
+    }
+    if (!info) return;
+    // Single-image mode: session-local ROI; re-fetch the live boxes.
+    singleRoi = roi;
+    await viewer?.refreshDetections(overlay.threshold, roi);
   }
 
   // One panel at a time: opening any of the three closes the other two, so
@@ -1918,6 +2028,22 @@
       <div class="toolbar-group">
         <button
           class="btn"
+          title="Undo brush stroke (cmd-z)"
+          onclick={undoBrushStroke}
+          disabled={currentStrokes().length === 0}
+        >
+          <Icon name="undo" /> Undo
+        </button>
+        <button
+          class="btn"
+          title="Redo brush stroke (shift-cmd-z)"
+          onclick={redoBrushStroke}
+          disabled={currentRedoStrokes().length === 0}
+        >
+          <Icon name="redo" /> Redo
+        </button>
+        <button
+          class="btn"
           title={detected ? "Already detected; the slider re-thresholds live" : "Detect (d)"}
           onclick={requestDetect}
           disabled={loading !== null || isDetecting || detected}
@@ -1933,6 +2059,26 @@
           disabled={loading !== null || isDetecting || isHealing || !info}
         >
           <Icon name="heal" /> {isHealing ? "Healing..." : "Heal"}
+        </button>
+        <button
+          class="btn"
+          class:btn-toggle-on={roiModeActive}
+          title="Draw a region of interest (r): only defects inside it are detected and shown, excluding scan edges and borders"
+          aria-label="Set region of interest"
+          aria-pressed={roiModeActive}
+          disabled={loading !== null}
+          onclick={() => viewer?.toggleRoiMode()}
+        >
+          <Icon name="roi" /> Set ROI
+        </button>
+        <button
+          class="btn"
+          title="Clear the region of interest: detect over the whole frame again"
+          aria-label="Clear region of interest"
+          onclick={() => onRoiChange(null)}
+          disabled={currentRoi === null || loading !== null}
+        >
+          <Icon name="clear" /> Clear ROI
         </button>
         {#if !roll}
           <button class="btn" title="Export" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
@@ -2041,26 +2187,53 @@
       </div>
     {/if}
   </header>
+  <!-- Workflow tabs: color grade first, then dust removal, then export. -->
+  <div class="workflow-tabs" role="tablist" aria-label="工作流">
+    <button
+      class="workflow-tab"
+      class:active={!gradeTab}
+      role="tab"
+      aria-selected={!gradeTab}
+      onclick={() => (gradeTab = false)}
+    >
+      <Icon name="paint" /> 除尘
+    </button>
+    <button
+      class="workflow-tab"
+      class:active={gradeTab}
+      role="tab"
+      aria-selected={gradeTab}
+      onclick={() => (gradeTab = true)}
+    >
+      <Icon name="overlay" /> 校色
+    </button>
+  </div>
   <section class="stage">
     {#if info}
-      <!-- One persistent Viewer: it reacts to `info` changing instead of
-           being remounted, keeping the GL context and tile cache warm so
-           switching to an already-decoded frame is instant. -->
-      <Viewer
-        bind:this={viewer}
-        {info}
-        {overlay}
-        {detected}
-        healedAvailable={info.healed ?? false}
-        onRequestDetect={requestDetect}
-        onRequestHeal={requestHeal}
-        bboxes={roll ? roll.frames[displayedIndex].bboxes : null}
-        strokes={currentStrokes()}
-        redoStrokes={currentRedoStrokes()}
-        {onStrokesChange}
-        onBrushLimit={(message) => pushError(message)}
-        onDetectionsChange={(count) => (liveDefectCount = count)}
-      />
+      {#if gradeTab}
+        <GradePanel imageId={info.id} />
+      {:else}
+        <!-- One persistent Viewer: it reacts to `info` changing instead of
+             being remounted, keeping the GL context and tile cache warm so
+             switching to an already-decoded frame is instant. -->
+        <Viewer
+          bind:this={viewer}
+          {info}
+          {overlay}
+          {detected}
+          healedAvailable={info.healed ?? false}
+          onRequestDetect={requestDetect}
+          onRequestHeal={requestHeal}
+          bboxes={roll ? roll.frames[displayedIndex].bboxes : null}
+          strokes={currentStrokes()}
+          redoStrokes={currentRedoStrokes()}
+          {onStrokesChange}
+          onBrushLimit={(message) => pushError(message)}
+          onDetectionsChange={(count) => (liveDefectCount = count)}
+          roi={currentRoi}
+          {onRoiChange}
+        />
+      {/if}
     {:else if !showLoader}
       <div class="empty-state">
         <svg class="empty-art" viewBox="0 0 96 64" aria-hidden="true">
@@ -2159,6 +2332,33 @@
     flex: 1;
     min-height: 0;
     position: relative;
+  }
+  .workflow-tabs {
+    display: flex;
+    gap: var(--space-1);
+    padding: 0 var(--space-3);
+    padding-top: var(--space-1);
+    border-bottom: 1px solid var(--border);
+  }
+  .workflow-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: var(--space-1) var(--space-3);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-2);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+  .workflow-tab:hover {
+    color: var(--text-1);
+  }
+  .workflow-tab.active {
+    color: var(--text-1);
+    border-bottom-color: var(--accent);
+    font-weight: 600;
   }
   .stage-overlay {
     position: absolute;

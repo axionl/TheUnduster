@@ -3,6 +3,7 @@
 mod cache;
 mod detect;
 mod export;
+mod grade;
 mod images;
 mod jobs;
 mod masks;
@@ -203,7 +204,7 @@ async fn run_detect(
     // as the components/set_frame_threshold commands: this was the last sync
     // CCL under the Images lock (TheUnduster-u98). Still primes the memo for
     // the threshold slider's first render.
-    let components_at_half = compute_components(images, id, 0.5)
+    let components_at_half = compute_components(images, id, 0.5, None)
         .await?
         .unwrap_or_default()
         .len();
@@ -276,6 +277,7 @@ async fn run_heal(
     inpainter: &State<'_, detect::InpainterState>,
     id: u64,
     threshold: f32,
+    roi: Option<[u32; 4]>,
     strokes: Vec<masks::Stroke>,
 ) -> Result<HealSummary, String> {
     if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
@@ -285,9 +287,15 @@ async fn run_heal(
     let (image, mask, activation_stamp) = {
         let images = images.lock().map_err(|e| e.to_string())?;
         let image = images.image(id).ok_or_else(|| format!("no image {id}"))?;
+        // The ROI excludes everything outside it from the detected mask, so
+        // the heal skips work in the excluded margin. No probabilities (frame
+        // never detected): fall back to a strokes-only heal -- the mask
+        // starts all-false and the operator's manual strokes supply the
+        // region to repair. When there are also no strokes the mask is empty
+        // and heal_with_progress simply repairs nothing.
         let mask = images
-            .threshold_mask(id, threshold)
-            .ok_or_else(|| format!("no detection for image {id}"))?;
+            .threshold_mask(id, threshold, roi)
+            .unwrap_or_else(|| vec![false; (image.width as usize) * (image.height as usize)]);
         // Activation-time stamp, same rationale as run_detect: the heal
         // cache write must be stamped against the source these registry
         // pixels came from, not a fresh stat (TheUnduster-02y).
@@ -405,6 +413,7 @@ async fn heal_frame(
     inpainter: State<'_, detect::InpainterState>,
     id: u64,
     threshold: f32,
+    roi: Option<[u32; 4]>,
     strokes: Vec<masks::Stroke>,
 ) -> Result<HealSummary, String> {
     let _ = app.emit(
@@ -415,11 +424,96 @@ async fn heal_frame(
         },
     );
     let result = run_heal(
-        &app, &images, &roll, &detector, &inpainter, id, threshold, strokes,
+        &app, &images, &roll, &detector, &inpainter, id, threshold, roi, strokes,
     )
     .await;
     let _ = app.emit("app-progress", Progress { id, stage: "ready" });
     result
+}
+
+/// Renders a downsampled, graded preview of a frame as a base64 PNG for the
+/// color-grade tab's live preview. The engine is pure Rust (`grade::apply_grade`),
+/// so dragging a slider recomputes a low-res preview (bounded by `max_edge`)
+/// rather than touching the GPU. `None` when the frame isn't resident.
+#[tauri::command]
+fn grade_preview(
+    images: State<'_, Mutex<Images>>,
+    id: u64,
+    settings: grade::GradeSettings,
+    max_edge: u32,
+) -> Result<Option<String>, String> {
+    use std::io::Cursor;
+    use base64::Engine;
+    use image::ImageEncoder;
+    let img = images
+        .lock()
+        .map_err(|e| e.to_string())?
+        .image(id)
+        .ok_or_else(|| format!("no image {id}"))?;
+    // Downsample the SOURCE to the preview edge first, then grade only that
+    // small image -- grading the full-res frame on every slider tick would be
+    // far too slow for an interactive preview on large scans.
+    let (w, h) = (img.width, img.height);
+    let scale = (max_edge.max(1) as f32) / (w.max(h).max(1) as f32);
+    let tw = ((w as f32) * scale).max(1.0).round() as u32;
+    let th = ((h as f32) * scale).max(1.0).round() as u32;
+    let mut src_rgb = image::RgbImage::new(w, h);
+    let src_f = img.to_f32();
+    for i in 0..(w as usize * h as usize) {
+        let (x, y) = ((i % w as usize) as u32, (i / w as usize) as u32);
+        let (r, g, b) = if img.channels >= 3 {
+            (src_f[i * 3], src_f[i * 3 + 1], src_f[i * 3 + 2])
+        } else {
+            (src_f[i], src_f[i], src_f[i])
+        };
+        src_rgb.put_pixel(x, y, image::Rgb([(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]));
+    }
+    let thumb = image::imageops::thumbnail(&src_rgb, tw, th);
+    let small = fd_io::ImageBuf {
+        width: tw,
+        height: th,
+        channels: 3,
+        data: fd_io::PixelData::U8(thumb.as_raw().clone()),
+        icc: None,
+        exif: None,
+    };
+    let graded = grade::apply_grade(&small, &settings);
+    let mut buf = Cursor::new(Vec::new());
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(
+            &graded_into_rgb8(&graded),
+            tw,
+            th,
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(Some(base64::engine::general_purpose::STANDARD.encode(buf.into_inner())))
+}
+
+/// Extracts RGB8 bytes from a graded ImageBuf (the preview is 8-bit anyway).
+fn graded_into_rgb8(img: &fd_io::ImageBuf) -> Vec<u8> {
+    match &img.data {
+        fd_io::PixelData::U8(v) => v.clone(),
+        fd_io::PixelData::U16(v) => v.iter().map(|p| (p >> 8) as u8).collect(),
+    }
+}
+
+/// Auto-Invert analysis: estimates base density and D-Min/D-Max bounds from
+/// the frame's own density distribution, returning a `GradeSettings` ready to
+/// apply (`invert = true`). Mirrors NexFilm's Auto Invert.
+#[tauri::command]
+fn grade_analyze(
+    images: State<'_, Mutex<Images>>,
+    id: u64,
+    low_quantile: f32,
+    high_quantile: f32,
+) -> Result<grade::GradeSettings, String> {
+    let img = images
+        .lock()
+        .map_err(|e| e.to_string())?
+        .image(id)
+        .ok_or_else(|| format!("no image {id}"))?;
+    Ok(grade::analyze_base_and_bounds(&img, low_quantile, high_quantile))
 }
 
 #[tauri::command]
@@ -452,7 +546,7 @@ fn heal_cached(
     inpainter: State<'_, detect::InpainterState>,
     index: usize,
 ) -> Result<bool, String> {
-    let (path, file_name, threshold, strokes) = roll.export_frame_meta(index)?;
+    let (path, file_name, threshold, _roi, strokes) = roll.export_frame_meta(index)?;
     let Some(stamp) = stamp_or_skip(&path) else {
         return Ok(false);
     };
@@ -552,10 +646,11 @@ async fn compute_components(
     images: &State<'_, Mutex<Images>>,
     id: u64,
     threshold: f32,
+    roi: Option<[u32; 4]>,
 ) -> Result<Option<Vec<[u32; 4]>>, String> {
     let snapshot = {
         let images = images.lock().map_err(|e| e.to_string())?;
-        if let Some(hit) = images.components_memo_hit(id, threshold) {
+        if let Some(hit) = images.components_memo_hit(id, threshold, roi) {
             return Ok(Some(hit));
         }
         images.probs_snapshot(id)
@@ -565,13 +660,13 @@ async fn compute_components(
     };
     let probs_for_walk = probs.clone();
     let boxes = tauri::async_runtime::spawn_blocking(move || {
-        images::components_from_probs(&probs_for_walk, width, height, threshold)
+        images::components_from_probs(&probs_for_walk, width, height, threshold, roi)
     })
     .await
     .map_err(|e| e.to_string())?;
     {
         let mut images = images.lock().map_err(|e| e.to_string())?;
-        images.store_components_memo(id, &probs, threshold, boxes.clone());
+        images.store_components_memo(id, &probs, threshold, roi, boxes.clone());
     }
     Ok(Some(boxes))
 }
@@ -581,8 +676,9 @@ async fn components(
     images: State<'_, Mutex<Images>>,
     id: u64,
     threshold: f32,
+    roi: Option<[u32; 4]>,
 ) -> Result<Vec<[u32; 4]>, String> {
-    compute_components(&images, id, threshold)
+    compute_components(&images, id, threshold, roi)
         .await?
         .ok_or_else(|| format!("no detection for image {id}"))
 }
@@ -1122,16 +1218,51 @@ async fn set_frame_threshold(
     images: State<'_, Mutex<Images>>,
     index: usize,
     threshold: f32,
+    roi: Option<[u32; 4]>,
     generation: u64,
 ) -> Result<Option<usize>, String> {
     let (count, bboxes) = match roll.image_id(index)? {
-        Some(id) => match compute_components(&images, id, threshold).await? {
+        Some(id) => match compute_components(&images, id, threshold, roi).await? {
             Some(bboxes) => (Some(bboxes.len()), Some(bboxes)),
             None => (None, None),
         },
         None => (None, None),
     };
     if roll.set_threshold_and_components(generation, index, threshold, count, bboxes)? {
+        Ok(count)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Sets a frame's ROI (region of interest) and, when the frame's image is
+/// registry-resident with probabilities, recomputes and persists its
+/// component count and boxes WITH the ROI applied -- so the operator sees the
+/// edge-exclusion take effect immediately, without re-running the detector.
+/// The threshold passed in is used only for that recompute walk (the frame's
+/// stored threshold should match); `set_frame_roi_and_components` writes the
+/// ROI + recomputed boxes, not the threshold. Returns the new count: `None`
+/// when the frame isn't resident or has no probabilities (nothing to
+/// recompute), or when the write was discarded because the roll changed
+/// mid-command -- either way the frontend leaves its chip alone. Mirrors
+/// `set_frame_threshold`'s generation/discard shape.
+#[tauri::command]
+async fn set_frame_roi(
+    roll: State<'_, roll::RollState>,
+    images: State<'_, Mutex<Images>>,
+    index: usize,
+    roi: Option<[u32; 4]>,
+    threshold: f32,
+    generation: u64,
+) -> Result<Option<usize>, String> {
+    let (count, bboxes) = match roll.image_id(index)? {
+        Some(id) => match compute_components(&images, id, threshold, roi).await? {
+            Some(bboxes) => (Some(bboxes.len()), Some(bboxes)),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+    if roll.set_frame_roi_and_components(generation, index, roi, count, bboxes)? {
         Ok(count)
     } else {
         Ok(None)
@@ -1428,6 +1559,7 @@ fn scan_roll(
                         image.width,
                         image.height,
                         SCAN_THRESHOLD,
+                        None,
                     );
                     // Cache write is sequential with detection here (milliseconds
                     // against a ~9s detect); failures eprintln in debug only,
@@ -1659,7 +1791,7 @@ impl Drop for PinGuard {
 /// queue's per-frame outcome shape.
 async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Result<(), String> {
     let index = job.index;
-    let (path, file_name, threshold, strokes) =
+    let (path, file_name, threshold, roi, strokes) =
         app.state::<roll::RollState>().export_frame_meta(index)?;
     let image_id = app.state::<roll::RollState>().image_id(index)?;
     let _ = app.emit(
@@ -1804,6 +1936,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                     image.width,
                     image.height,
                     SCAN_THRESHOLD,
+                    None,
                 );
                 let pyramid = level_dims.map(|dims| build_prob_pyramid_u8(&probs, &dims));
                 Ok::<_, String>((probs, pyramid, bboxes))
@@ -1887,8 +2020,9 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         Some(img) => {
                             // None until a detection is resident; the closure
                             // below then falls back to the probs cache or a
-                            // fresh model run.
-                            let mask = images.threshold_mask(id, threshold);
+                            // fresh model run. The ROI is applied so the heal
+                            // never touches the excluded margin.
+                            let mask = images.threshold_mask(id, threshold, roi);
                             (Some(id), Some(img), mask, images.source_stamp(id))
                         }
                         None => (None, None, None, None), // stale id: fresh decode
@@ -1982,9 +2116,18 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                 ),
                                 _ => None,
                             };
-                            let probs = match cached {
-                                Some(p) => p,
-                                None => {
+                            match cached {
+                                Some(p) => images::threshold_mask_roi(
+                                    &p,
+                                    image.width,
+                                    image.height,
+                                    threshold,
+                                    roi,
+                                ),
+                                // No cached probabilities and nothing manually
+                                // painted: a fresh detect is the historical
+                                // behavior (auto-detect then heal).
+                                None if strokes.is_empty() => {
                                     // detect_hashed pairs the output with the
                                     // hash of the model that produced it
                                     // under one lock -- see its doc comment
@@ -2011,10 +2154,23 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                             );
                                         }
                                     }
-                                    probs
+                                    images::threshold_mask_roi(
+                                        &probs,
+                                        image.width,
+                                        image.height,
+                                        threshold,
+                                        roi,
+                                    )
                                 }
-                            };
-                            images::threshold_mask_from_probs(&probs, threshold)
+                                // Manual strokes and no probabilities: heal
+                                // only what was painted -- no detect pass, and
+                                // the threshold is irrelevant. This is the
+                                // fast path the operator reaches by painting a
+                                // defect and hitting heal directly.
+                                None => {
+                                    vec![false; (image.width as usize) * (image.height as usize)]
+                                }
+                            }
                         }
                     };
 
@@ -2210,7 +2366,13 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             .iter()
                             .map(|&p| quantize_prob(p))
                             .collect();
-                        let raw = images::threshold_mask_from_probs(&probs, threshold);
+                        let raw = images::threshold_mask_roi(
+                            &probs,
+                            image.width,
+                            image.height,
+                            threshold,
+                            roi,
+                        );
                         let mask = masks::compose_heal_mask(
                             raw,
                             image.width,
@@ -2836,6 +2998,8 @@ pub fn run() {
             load_inpainter,
             heal_frame,
             heal_cached,
+            grade_preview,
+            grade_analyze,
             healed_cached_all,
             components,
             open_roll,
@@ -2845,6 +3009,7 @@ pub fn run() {
             path_kind,
             activate_frame,
             set_frame_threshold,
+            set_frame_roi,
             approve_frame,
             unapprove_frame,
             set_frame_strokes,
@@ -2866,14 +3031,28 @@ pub fn run() {
             protocol::tile_response(&images, &roll.roll, request.uri().path())
         })
         .setup(|app| {
-            #[cfg(debug_assertions)]
+            // Detector 自动加载。项目当前只有 fixture 模型（README：真实
+            // 缺陷检测器尚未训练完成），加载它让 Detect 在 dev 与打包版都
+            // 可用。Prefer the trained demo model; the random-weight tiny
+            // detector exists only for protocol tests and fires on everything
+            // when pointed at real scans.
+            //
+            // debug：从开发 fixtures 目录加载（CARGO_MANIFEST_DIR 只在
+            // 编译期有效，打包后的 .app 里没有该路径）。
+            // release：从随 bundle 打进 .app 的 Resources/fixtures/ 加载
+            // （见 tauri.conf.json 的 bundle.resources），否则打包版不会
+            // 加载任何 detector，Detect 会报 "no detector loaded"。
             {
                 use tauri::Manager;
-                // Prefer the trained demo model; the random-weight tiny
-                // detector exists only for protocol tests and fires on
-                // everything when pointed at real scans.
+                #[cfg(debug_assertions)]
                 let fixtures =
                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures");
+                #[cfg(not(debug_assertions))]
+                let fixtures = app
+                    .path()
+                    .resource_dir()
+                    .map(|dir| dir.join("fixtures"))
+                    .unwrap_or_default();
                 let state = app.state::<detect::DetectorState>();
                 if state.load(&fixtures.join("demo-detector.onnx")).is_err() {
                     let _ = state.load(&fixtures.join("tiny-detector.onnx"));

@@ -109,6 +109,28 @@ void main() {
   outColor = vec4(color.rgb, color.a * alpha);
 }`;
 
+/** Screen-space filled-rectangle pass for the ROI affordances (the dim-out
+ * outside the ROI and its amber outline). Position comes from a [0,1]^2 unit
+ * quad scaled to rectMin..rectMax, so one quad buffer serves every strip. */
+const RECT_VERT = `#version 300 es
+in vec2 corner;      // [0,1]^2 unit quad
+uniform vec2 viewport;
+uniform vec2 rectMin; // screen px, top-left
+uniform vec2 rectMax; // screen px, bottom-right
+void main() {
+  vec2 pos = rectMin + corner * (rectMax - rectMin);
+  vec2 clip = (pos / viewport) * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+}`;
+
+const RECT_FRAG = `#version 300 es
+precision mediump float;
+out vec4 color;
+uniform vec4 uColor;
+void main() {
+  color = uColor;
+}`;
+
 /** One brush-stroke segment in screen/device pixels. A dab (single click,
  * no drag) passes ax==bx, ay==by, which collapses the capsule to a circle. */
 export interface StrokeSegment {
@@ -177,6 +199,8 @@ export class TileRenderer {
   private ringBuf: WebGLBuffer;
   private capsuleProgram: WebGLProgram;
   private capsuleBuf: WebGLBuffer;
+  private rectProgram: WebGLProgram;
+  private rectBuf: WebGLBuffer;
   private textures = new TextureStore<WebGLTexture>(256 * 1024 * 1024);
   private pending = new Set<string>();
   private zeroTex: WebGLTexture;
@@ -241,6 +265,25 @@ export class TileRenderer {
     }
     this.capsuleProgram = cp;
     this.capsuleBuf = gl.createBuffer()!;
+
+    // Rect program: a [0,1]^2 unit quad scaled per filled strip via the
+    // rectMin/rectMax uniforms (ROI dim-out + outline). ROI rect counts are
+    // tiny, so per-rect uniform updates + draw calls are not a concern.
+    const rectp = gl.createProgram()!;
+    gl.attachShader(rectp, compile(gl, gl.VERTEX_SHADER, RECT_VERT));
+    gl.attachShader(rectp, compile(gl, gl.FRAGMENT_SHADER, RECT_FRAG));
+    gl.linkProgram(rectp);
+    if (!gl.getProgramParameter(rectp, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(rectp) ?? "rect link failed");
+    }
+    this.rectProgram = rectp;
+    this.rectBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.rectBuf);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1]),
+      gl.STATIC_DRAW,
+    );
   }
 
   /** Fetch a tile via tiles:// and upload it; no-op if cached or in flight.
@@ -472,6 +515,65 @@ export class TileRenderer {
     gl.disable(gl.BLEND);
   }
 
+  /** Draws the ROI affordances directly onto the frame's WebGL canvas (the
+   * image, the dim-out outside the ROI, and the amber outline). Drawn on the
+   * SAME canvas as the tiles/rings/strokes -- the ROI must not live on a
+   * separate canvas stacked over the WebGL surface, because in WKWebView a
+   * canvas on top of a WebGL canvas breaks the WebGL surface's display.
+   * Call after draw(). `rect` is the ROI in screen px (top-left x0,y0 to
+   * bottom-right x1,y1), already clamped to the image; a committed ROI also
+   * dims, while a live drag preview (rect only, no dim-out) is passed with
+   * `dim = false`. */
+  drawRoi(
+    rect: { x0: number; y0: number; x1: number; y1: number },
+    canvasW: number,
+    canvasH: number,
+    dim: boolean,
+  ): void {
+    const gl = this.gl;
+    const x0 = Math.max(0, rect.x0);
+    const y0 = Math.max(0, rect.y0);
+    const x1 = Math.min(canvasW, rect.x1);
+    const y1 = Math.min(canvasH, rect.y1);
+    if (x1 <= x0 || y1 <= y0) return;
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(this.rectProgram);
+    const viewLoc = gl.getUniformLocation(this.rectProgram, "viewport");
+    const minLoc = gl.getUniformLocation(this.rectProgram, "rectMin");
+    const maxLoc = gl.getUniformLocation(this.rectProgram, "rectMax");
+    const colorLoc = gl.getUniformLocation(this.rectProgram, "uColor");
+    gl.uniform2f(viewLoc, canvasW, canvasH);
+    const cornerLoc = gl.getAttribLocation(this.rectProgram, "corner");
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.rectBuf);
+    gl.enableVertexAttribArray(cornerLoc);
+    gl.vertexAttribPointer(cornerLoc, 2, gl.FLOAT, false, 8, 0);
+    const fill = (rx0: number, ry0: number, rx1: number, ry1: number, c: [number, number, number, number]) => {
+      if (rx1 <= rx0 || ry1 <= ry0) return;
+      gl.uniform2f(minLoc, rx0, ry0);
+      gl.uniform2f(maxLoc, rx1, ry1);
+      gl.uniform4f(colorLoc, ...c);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    };
+    if (dim) {
+      const dimC: [number, number, number, number] = [0, 0, 0, 0.55];
+      // Four strips around the box; the horizontal strips span full width and
+      // the vertical ones cover the corner columns, so no pixel is double-
+      // darkened past 0.55.
+      fill(0, 0, canvasW, y0, dimC);
+      fill(0, y1, canvasW, canvasH, dimC);
+      fill(0, y0, x0, y1, dimC);
+      fill(x1, y0, canvasW, y1, dimC);
+    }
+    const amber: [number, number, number, number] = [1.0, 0.72, 0.24, dim ? 0.9 : 0.6];
+    const t = 2;
+    fill(x0 - t, y0 - t, x1 + t, y0 + t, amber); // top
+    fill(x0 - t, y1 - t, x1 + t, y1 + t, amber); // bottom
+    fill(x0 - t, y0, x0 + t, y1, amber); // left
+    fill(x1 - t, y0, x1 + t, y1, amber); // right
+    gl.disable(gl.BLEND);
+  }
+
   /** Release every GL resource and force the context to be dropped. The
    * Viewer is remounted per frame switch via `{#key info.id}`; without this,
    * each remount leaks a WebGL context (WebKit caps live contexts at ~16),
@@ -484,9 +586,11 @@ export class TileRenderer {
     gl.deleteBuffer(this.buf);
     gl.deleteBuffer(this.ringBuf);
     gl.deleteBuffer(this.capsuleBuf);
+    gl.deleteBuffer(this.rectBuf);
     gl.deleteProgram(this.program);
     gl.deleteProgram(this.ringProgram);
     gl.deleteProgram(this.capsuleProgram);
+    gl.deleteProgram(this.rectProgram);
     gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 }

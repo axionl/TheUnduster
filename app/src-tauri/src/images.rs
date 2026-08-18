@@ -87,7 +87,12 @@ struct Entry {
     /// which a single last-threshold memo already captures; anything more
     /// would be unbounded growth for no observed repeat pattern. Cleared by
     /// every probs writer (`set_probs_built`; `close` drops the whole entry).
-    components_memo: Option<(u8, Vec<[u32; 4]>)>,
+    // Memoized component walk: `(quantized_threshold, roi, boxes)`. The ROI
+    // is part of the key because restricting the walk to a region-of-interest
+    // changes which boxes a given threshold yields -- a same-threshold hit
+    // under a different ROI must recompute, not return stale boxes.
+    // (Named alias keeps clippy::type_complexity happy.)
+    components_memo: Option<ComponentsMemo>,
     healed: Option<HealedData>,
     /// Source stamp captured immediately BEFORE this entry's pixels were
     /// decoded (activation/open time). Cache writes made later from these
@@ -107,19 +112,73 @@ pub struct Prepared {
     pub(crate) stamp: Option<crate::cache::SourceStamp>,
 }
 
+/// Memoized connected-component walk, keyed by `(quantized threshold, roi)`
+/// and storing the resulting boxes: a same-threshold call under a different
+/// ROI must recompute, so the ROI is part of the cache key, not just the
+/// threshold. Named alias keeps the `Entry` field readable and satisfies
+/// clippy::type_complexity.
+type ComponentsMemo = (u8, Option<[u32; 4]>, Vec<[u32; 4]>);
+
 /// Connected-component bounding boxes from a thresholded probability map,
 /// capped at [`MAX_COMPONENTS`]: a pathological mask (bad model or
 /// threshold) can otherwise produce hundreds of thousands of boxes that are
 /// useless for navigation and expensive to serialize. Free function so the
 /// roll background queue (which never inserts its frame into the `Images`
 /// registry -- see `scan_roll`) can compute bboxes without a registry entry.
+/// Clears every mask pixel OUTSIDE the ROI. A ROI restricts detection to a
+/// sub-rectangle: pixels outside it are forced below threshold, so both the
+/// CCL walk (`components_from_probs`) and the heal mask never touch the
+/// excluded margin -- scan-edge black bars / borders that the tiled
+/// detector's edge-replicate padding misreads as defects simply vanish. This
+/// also means the heal skips ROI-excluded regions, which is the point of the
+/// ROI: no detect work and no healing there. `None` (whole image) is the
+/// identity. Coords are clamped into the image so a stale/oversized sidecar
+/// ROI can never panic the walk.
+pub(crate) fn apply_roi_to_mask(
+    mut mask: Vec<bool>,
+    width: u32,
+    height: u32,
+    roi: Option<[u32; 4]>,
+) -> Vec<bool> {
+    if let Some([x0, y0, x1, y1]) = roi {
+        let (w, h) = (width as usize, height as usize);
+        if w > 0 && h > 0 {
+            let (x0, y0) = ((x0 as usize).min(w - 1), (y0 as usize).min(h - 1));
+            let (x1, y1) = ((x1 as usize).min(w - 1), (y1 as usize).min(h - 1));
+            for y in 0..h {
+                if y < y0 || y > y1 {
+                    mask[y * w..(y + 1) * w].fill(false);
+                } else {
+                    mask[y * w..y * w + x0].fill(false);
+                    mask[y * w + x1 + 1..(y + 1) * w].fill(false);
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// Threshold mask with the ROI applied, for the heal path: pixels outside the
+/// ROI are below threshold, so `compose_heal_mask` never heals the excluded
+/// margin (the ROI's whole point -- skip heal work there).
+pub(crate) fn threshold_mask_roi(
+    probs: &[u8],
+    width: u32,
+    height: u32,
+    threshold: f32,
+    roi: Option<[u32; 4]>,
+) -> Vec<bool> {
+    apply_roi_to_mask(threshold_mask_from_probs(probs, threshold), width, height, roi)
+}
+
 pub fn components_from_probs(
     probs: &[u8],
     width: u32,
     height: u32,
     threshold: f32,
+    roi: Option<[u32; 4]>,
 ) -> Vec<[u32; 4]> {
-    let mask = threshold_mask_from_probs(probs, threshold);
+    let mask = apply_roi_to_mask(threshold_mask_from_probs(probs, threshold), width, height, roi);
     // components_up_to caps the WALK itself, not just the returned list: on
     // a pathological mask the old full-walk-then-take paid for hundreds of
     // thousands of specks it was about to throw away (TheUnduster-csb). The
@@ -350,10 +409,21 @@ impl Images {
     /// threshold at native resolution (see [`threshold_mask_from_probs`] for
     /// the rule and its boundary semantics); None until a detection has
     /// stored probabilities for this image.
-    pub fn threshold_mask(&self, id: u64, threshold: f32) -> Option<Vec<bool>> {
+    pub fn threshold_mask(
+        &self,
+        id: u64,
+        threshold: f32,
+        roi: Option<[u32; 4]>,
+    ) -> Option<Vec<bool>> {
         let entry = self.entries.get(&id)?;
         let (probs, _) = entry.probs.as_ref()?;
-        Some(threshold_mask_from_probs(probs, threshold))
+        Some(threshold_mask_roi(
+            probs,
+            entry.image.width,
+            entry.image.height,
+            threshold,
+            roi,
+        ))
     }
 
     pub fn has_healed(&self, id: u64) -> bool {
@@ -482,29 +552,39 @@ impl Images {
     /// the reference implementation the parity tests compare
     /// `components_from_probs` against.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn components(&mut self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
-        if let Some(hit) = self.components_memo_hit(id, threshold) {
+    pub fn components(
+        &mut self,
+        id: u64,
+        threshold: f32,
+        roi: Option<[u32; 4]>,
+    ) -> Option<Vec<[u32; 4]>> {
+        if let Some(hit) = self.components_memo_hit(id, threshold, roi) {
             return Some(hit);
         }
         let entry = self.entries.get(&id)?;
         let (probs, _) = entry.probs.as_ref()?;
         let (w, h) = (entry.image.width, entry.image.height);
-        let boxes = components_from_probs(probs, w, h, threshold);
+        let boxes = components_from_probs(probs, w, h, threshold, roi);
         let entry = self.entries.get_mut(&id)?;
-        entry.components_memo = Some((quantize_prob(threshold), boxes.clone()));
+        entry.components_memo = Some((quantize_prob(threshold), roi, boxes.clone()));
         Some(boxes)
     }
 
     /// Read-only memo check, without running or storing anything: `Some` iff
-    /// a memoized walk exists for `id` at `threshold`'s quantized value.
-    /// Shared by the in-lock [`Self::components`] and the lock-free async
-    /// path in lib.rs, which checks this before deciding whether a
+    /// a memoized walk exists for `id` at `threshold`'s quantized value AND
+    /// ROI. Shared by the in-lock [`Self::components`] and the lock-free
+    /// async path in lib.rs, which checks this before deciding whether a
     /// `spawn_blocking` walk is even needed.
-    pub fn components_memo_hit(&self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
+    pub fn components_memo_hit(
+        &self,
+        id: u64,
+        threshold: f32,
+        roi: Option<[u32; 4]>,
+    ) -> Option<Vec<[u32; 4]>> {
         let qt = quantize_prob(threshold);
         let entry = self.entries.get(&id)?;
-        let (memo_qt, boxes) = entry.components_memo.as_ref()?;
-        (*memo_qt == qt).then(|| boxes.clone())
+        let (memo_qt, memo_roi, boxes) = entry.components_memo.as_ref()?;
+        (*memo_qt == qt && *memo_roi == roi).then(|| boxes.clone())
     }
 
     /// Cheap (`Arc::clone`) snapshot of an entry's probs plus native dims,
@@ -530,6 +610,7 @@ impl Images {
         id: u64,
         probs: &Arc<Vec<u8>>,
         threshold: f32,
+        roi: Option<[u32; 4]>,
         boxes: Vec<[u32; 4]>,
     ) {
         let Some(entry) = self.entries.get_mut(&id) else {
@@ -541,7 +622,7 @@ impl Images {
         if !Arc::ptr_eq(current, probs) {
             return;
         }
-        entry.components_memo = Some((quantize_prob(threshold), boxes));
+        entry.components_memo = Some((quantize_prob(threshold), roi, boxes));
     }
 
     pub fn close(&mut self, id: u64) {
@@ -674,12 +755,12 @@ mod tests {
         assert_eq!((w, h), (512, 400));
         assert_eq!(bytes.len(), (512 * 400) as usize);
         assert!(bytes[100 * 512 + 200] > 200);
-        let comps = images.components(info.id, 0.5).unwrap();
+        let comps = images.components(info.id, 0.5, None).unwrap();
         assert_eq!(comps.len(), 1);
         let b = comps[0];
         assert_eq!((b[0], b[1], b[2], b[3]), (200, 100, 205, 104));
         assert!(images.prob_tile(999, 0, 0, 0).is_none());
-        assert!(images.components(info.id, 0.9).unwrap().is_empty());
+        assert!(images.components(info.id, 0.9, None).unwrap().is_empty());
     }
 
     #[test]
@@ -692,11 +773,11 @@ mod tests {
         probs[100 * 600 + 200] = quantize_prob(0.8);
         assert!(images.set_probs(info.id, probs));
 
-        let first = images.components(info.id, 0.5).unwrap();
+        let first = images.components(info.id, 0.5, None).unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(
             images.entries.get(&info.id).unwrap().components_memo,
-            Some((quantize_prob(0.5), first.clone()))
+            Some((quantize_prob(0.5), None, first.clone()))
         );
 
         // Mutate the stored probs directly, bypassing `set_probs` -- the
@@ -716,14 +797,14 @@ mod tests {
         )
         .unwrap()[300 * 600 + 400] = quantize_prob(0.9);
 
-        let memoized = images.components(info.id, 0.5).unwrap();
+        let memoized = images.components(info.id, 0.5, None).unwrap();
         assert_eq!(memoized.len(), 1, "same-threshold call must not recompute");
 
-        let recomputed = images.components(info.id, 0.51).unwrap();
+        let recomputed = images.components(info.id, 0.51, None).unwrap();
         assert_eq!(recomputed.len(), 2, "threshold change must recompute");
         assert_eq!(
             images.entries.get(&info.id).unwrap().components_memo,
-            Some((quantize_prob(0.51), recomputed))
+            Some((quantize_prob(0.51), None, recomputed))
         );
     }
 
@@ -736,7 +817,7 @@ mod tests {
         let mut probs = vec![0u8; 600 * 400];
         probs[100 * 600 + 200] = quantize_prob(0.8);
         assert!(images.set_probs(info.id, probs));
-        assert_eq!(images.components(info.id, 0.5).unwrap().len(), 1);
+        assert_eq!(images.components(info.id, 0.5, None).unwrap().len(), 1);
         assert!(images
             .entries
             .get(&info.id)
@@ -759,7 +840,7 @@ mod tests {
 
         // A same-threshold call after set_probs must reflect the new probs,
         // not a stale memoized count.
-        assert_eq!(images.components(info.id, 0.5).unwrap().len(), 1);
+        assert_eq!(images.components(info.id, 0.5, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -775,14 +856,14 @@ mod tests {
         probs[100 * 600 + 200] = quantize_prob(0.8);
         assert!(images.set_probs(info.id, probs));
 
-        assert!(images.components_memo_hit(info.id, 0.5).is_none());
+        assert!(images.components_memo_hit(info.id, 0.5, None).is_none());
         let (probs_arc, w, h) = images.probs_snapshot(info.id).unwrap();
         assert_eq!((w, h), (600, 400));
 
-        let boxes = components_from_probs(&probs_arc, w, h, 0.5);
+        let boxes = components_from_probs(&probs_arc, w, h, 0.5, None);
         assert_eq!(boxes.len(), 1);
-        images.store_components_memo(info.id, &probs_arc, 0.5, boxes.clone());
-        assert_eq!(images.components_memo_hit(info.id, 0.5), Some(boxes));
+        images.store_components_memo(info.id, &probs_arc, 0.5, None, boxes.clone());
+        assert_eq!(images.components_memo_hit(info.id, 0.5, None), Some(boxes));
     }
 
     #[test]
@@ -800,7 +881,7 @@ mod tests {
 
         // Snapshot taken for a walk that's about to run "lock-free".
         let (stale_probs, w, h) = images.probs_snapshot(info.id).unwrap();
-        let stale_boxes = components_from_probs(&stale_probs, w, h, 0.5);
+        let stale_boxes = components_from_probs(&stale_probs, w, h, 0.5, None);
 
         // A fresh detect lands while that walk was in flight.
         let mut fresh = vec![0u8; 600 * 400];
@@ -809,16 +890,16 @@ mod tests {
 
         // The stale walk's write-back must be discarded, not overwrite the
         // (currently empty, post-set_probs) memo with old-generation data.
-        images.store_components_memo(info.id, &stale_probs, 0.5, stale_boxes);
-        assert!(images.components_memo_hit(info.id, 0.5).is_none());
+        images.store_components_memo(info.id, &stale_probs, 0.5, None, stale_boxes);
+        assert!(images.components_memo_hit(info.id, 0.5, None).is_none());
 
         // And a close mid-flight is discarded the same way (id gone, not a
         // stale Arc).
         let (probs_arc, w, h) = images.probs_snapshot(info.id).unwrap();
-        let boxes = components_from_probs(&probs_arc, w, h, 0.5);
+        let boxes = components_from_probs(&probs_arc, w, h, 0.5, None);
         images.close(info.id);
-        images.store_components_memo(info.id, &probs_arc, 0.5, boxes);
-        assert!(images.components_memo_hit(info.id, 0.5).is_none());
+        images.store_components_memo(info.id, &probs_arc, 0.5, None, boxes);
+        assert!(images.components_memo_hit(info.id, 0.5, None).is_none());
     }
 
     #[test]
@@ -844,7 +925,7 @@ mod tests {
         }
         assert!(painted > MAX_COMPONENTS);
         assert!(images.set_probs(info.id, probs));
-        let comps = images.components(info.id, 0.5).unwrap();
+        let comps = images.components(info.id, 0.5, None).unwrap();
         assert_eq!(comps.len(), MAX_COMPONENTS);
     }
 
@@ -855,7 +936,7 @@ mod tests {
         let mut images = Images::default();
         let info = images.open(&path).unwrap();
         assert!(!images.set_probs(info.id, vec![0u8; 10]));
-        assert!(images.components(info.id, 0.5).is_none()); // nothing stored
+        assert!(images.components(info.id, 0.5, None).is_none()); // nothing stored
     }
 
     #[test]
@@ -866,10 +947,53 @@ mod tests {
                 probs[y * 600 + x] = quantize_prob(0.8);
             }
         }
-        let direct = components_from_probs(&probs, 600, 400, 0.5);
+        let direct = components_from_probs(&probs, 600, 400, 0.5, None);
         assert_eq!(direct.len(), 1);
         assert_eq!(direct[0], [200, 100, 205, 104]);
-        assert!(components_from_probs(&probs, 600, 400, 0.9).is_empty());
+        assert!(components_from_probs(&probs, 600, 400, 0.9, None).is_empty());
+    }
+
+    #[test]
+    fn components_restrict_to_roi_excludes_outside_regions() {
+        // Two independent hot regions; a ROI must admit only the one it
+        // covers -- this is the mechanism that drops scan-edge black-bar
+        // false positives without re-running the detector.
+        let mut probs = vec![0u8; 600 * 400];
+        // region A at (200..205, 100..104)
+        for y in 100..104 {
+            for x in 200..205 {
+                probs[y * 600 + x] = quantize_prob(0.8);
+            }
+        }
+        // region B at (10..15, 300..304), far outside any ROI around A
+        for y in 300..304 {
+            for x in 10..15 {
+                probs[y * 600 + x] = quantize_prob(0.8);
+            }
+        }
+        // No ROI: both regions survive the walk.
+        assert_eq!(components_from_probs(&probs, 600, 400, 0.5, None).len(), 2);
+        // ROI around A excludes B.
+        let a_only = components_from_probs(&probs, 600, 400, 0.5, Some([100, 50, 500, 250]));
+        assert_eq!(a_only.len(), 1);
+        assert_eq!(a_only[0], [200, 100, 205, 104]);
+        // ROI around B excludes A.
+        let b_only = components_from_probs(&probs, 600, 400, 0.5, Some([0, 250, 100, 350]));
+        assert_eq!(b_only.len(), 1);
+        assert_eq!(b_only[0], [10, 300, 15, 304]);
+        // An out-of-image ROI clamps instead of panicking; this one clamps
+        // x1 to the right edge but still covers region A (and only A's y
+        // band), so exactly A survives.
+        assert_eq!(
+            components_from_probs(&probs, 600, 400, 0.5, Some([0, 0, 9999, 200])).len(),
+            1
+        );
+        // A fully out-of-image ROI clamps to the bottom-right corner, which
+        // covers no hot pixel here -- no panic, no component.
+        assert_eq!(
+            components_from_probs(&probs, 600, 400, 0.5, Some([9999, 9999, 10000, 10000])).len(),
+            0
+        );
     }
 
     #[test]
@@ -956,7 +1080,7 @@ mod tests {
         let path = temp_png(&dir, 600, 400);
         let mut images = Images::default();
         let info = images.open(&path).unwrap();
-        assert!(images.threshold_mask(info.id, 0.5).is_none());
+        assert!(images.threshold_mask(info.id, 0.5, None).is_none());
 
         let mut probs = vec![0u8; 600 * 400];
         for y in 100..104 {
@@ -966,10 +1090,38 @@ mod tests {
         }
         images.set_probs(info.id, probs);
 
-        let mask = images.threshold_mask(info.id, 0.5).unwrap();
+        let mask = images.threshold_mask(info.id, 0.5, None).unwrap();
         assert_eq!(mask.iter().filter(|&&b| b).count(), 4 * 5);
-        let none = images.threshold_mask(info.id, 0.9).unwrap();
+        let none = images.threshold_mask(info.id, 0.9, None).unwrap();
         assert!(none.iter().all(|&b| !b));
+    }
+
+    #[test]
+    fn threshold_mask_applies_roi_so_heal_skips_the_excluded_margin() {
+        // The heal path (`threshold_mask_roi`) must force pixels outside the
+        // ROI below threshold, exactly like the bbox walk does -- so a heal
+        // never works in the ROI-excluded margin.
+        let (w, h) = (600u32, 400u32);
+        let mut probs = vec![0u8; (w * h) as usize];
+        // a hot block inside a ROI
+        for y in 100..104 {
+            for x in 200..205 {
+                probs[(y * 600 + x) as usize] = quantize_prob(0.8);
+            }
+        }
+        // a hot block OUTSIDE that ROI
+        for y in 300..304 {
+            for x in 10..15 {
+                probs[(y * 600 + x) as usize] = quantize_prob(0.8);
+            }
+        }
+        // No ROI: both blocks are in the mask.
+        let all = threshold_mask_roi(&probs, w, h, 0.5, None);
+        assert_eq!(all.iter().filter(|&&b| b).count(), 2 * 4 * 5);
+        // ROI covering only the first block: the second is below threshold,
+        // so a heal touches nothing in the excluded margin.
+        let masked = threshold_mask_roi(&probs, w, h, 0.5, Some([100, 50, 500, 250]));
+        assert_eq!(masked.iter().filter(|&&b| b).count(), 4 * 5);
     }
 
     #[test]
@@ -987,12 +1139,12 @@ mod tests {
         let mut mismatched = build_prob_pyramid_u8(&probs, &level_dims);
         mismatched.levels[1].width = 299;
         assert!(!images.set_probs_built(info.id, probs.clone(), mismatched));
-        assert!(images.components(info.id, 0.5).is_none()); // nothing stored
+        assert!(images.components(info.id, 0.5, None).is_none()); // nothing stored
 
         // Sanity: a correctly-shaped pyramid is accepted.
         let good = build_prob_pyramid_u8(&probs, &level_dims);
         assert!(images.set_probs_built(info.id, probs.clone(), good));
-        assert!(images.components(info.id, 0.5).is_some());
+        assert!(images.components(info.id, 0.5, None).is_some());
 
         // Unknown id is rejected too.
         let another = build_prob_pyramid_u8(&probs, &level_dims);
@@ -1018,11 +1170,11 @@ mod tests {
         assert!(images.set_probs(info.id, probs));
 
         // bbox x1/y1 are exclusive (see prob_tiles_and_components_roundtrip).
-        let comps = images.components(info.id, 0.5).unwrap();
+        let comps = images.components(info.id, 0.5, None).unwrap();
         assert_eq!(comps, vec![[200, 200, 201, 201]]);
 
         // The same set through the free function and the mask.
-        let mask = images.threshold_mask(info.id, 0.5).unwrap();
+        let mask = images.threshold_mask(info.id, 0.5, None).unwrap();
         assert_eq!(mask.iter().filter(|&&b| b).count(), 1);
         assert!(mask[200 * 600 + 200]);
     }

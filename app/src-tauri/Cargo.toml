@@ -1,7 +1,8 @@
 [package]
 name = "unduster-app"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+authors = ["Ariel AxionL (i@axionl.me) | github id: @axionl"]
 
 [lib]
 name = "unduster_app"
@@ -24,6 +25,8 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util", "time"] }
 futures-util = "0.3"
 zstd = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
