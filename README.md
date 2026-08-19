@@ -1,9 +1,9 @@
-# TheUnduster
+# TheUnduster ikFilm+
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Platform: Apple Silicon macOS](https://img.shields.io/badge/platform-Apple%20Silicon%20macOS-black.svg)
 
-TheUnduster is a macOS desktop app that finds and removes dust and scratches from scanned film. It's a Tauri 2 + Svelte 5 frontend over a Rust engine. Defect detection runs a neural network through ONNX Runtime, using CoreML on Apple Silicon with a CPU fallback. Healing uses LaMa inpainting, downloaded on first run (207 MB). The app targets Apple Silicon Macs first.
+TheUnduster is a macOS desktop app that finds and removes dust and scratches from scanned film. It's a Tauri 2 + Svelte 5 frontend over a Rust engine. Defect detection runs a neural network through ONNX and the healing path reconstructs defects in place using a separate inpainting model and grain synthesis.
 
 See [docs/user-manual.md](docs/user-manual.md) for how to use the app.
 
@@ -15,12 +15,27 @@ See [docs/user-manual.md](docs/user-manual.md) for how to use the app.
 > [Models](#models) and [`training/`](training/README.md) below. Contributions
 > of labelled scans and training help are especially welcome.
 
+## Preview comparison
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/images/PreviewOrigin.jpg" width="100%" alt="Original scan preview before processing">
+      <br><sub>Original scan before ikFilm+ processing.</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/images/PreviewProcessed.jpg" width="100%" alt="Processed scan preview after dust and scratch removal">
+      <br><sub>Processed scan after ikFilm+ cleanup.</sub>
+    </td>
+  </tr>
+</table>
+
 ## Screenshots
 
 <table>
   <tr>
     <td width="50%" align="center">
-      <img src="docs/images/detection.png" width="100%" alt="TheUnduster with a scanned film frame open; red circles mark each detected dust spot and scratch, and a filmstrip of the roll runs along the bottom">
+      <img src="docs/images/detection.png" width="100%" alt="TheUnduster with a scanned film frame open; red circles mark each detected dust spot and scratch, and a filmstrip of the roll runs along the bottom.">
       <br><sub>Detection marks dust and scratches with red circles.</sub>
     </td>
     <td width="50%" align="center">
@@ -42,13 +57,13 @@ See [docs/user-manual.md](docs/user-manual.md) for how to use the app.
 
 ## Repository layout
 
-- `app/` — the desktop app. `app/src/` is the Svelte 5 frontend (Viewer, Filmstrip, StatusBar, queue and log panels). `app/src-tauri/` is the Rust backend: roll and sidecar state, the job queue, model download/verification, and the Tauri commands the frontend calls.
+- `app/` — the desktop app. `app/src/` is the Svelte 5 frontend (Viewer, Filmstrip, StatusBar, queue and log panels). `app/src-tauri/` is the Rust backend: roll and sidecar state, the job queue, model management, and scan processing.
 - `engine/` — a Rust workspace of the crates the app is built on:
   - `fd-io` — decode/encode TIFF, PNG, JPEG at 8/16 bit into native-depth pixel buffers.
   - `fd-tiles` — display pyramids and a byte-bounded LRU tile cache.
   - `fd-infer` — tiled ONNX defect detection (512px tiles, 64px overlap, probability averaging).
   - `fd-heal` — tiered healing: classical median fill for small defects, ONNX inpainting plus grain re-synthesis for larger ones, with a bit-exactness guarantee outside the healed mask.
-- `training/` — a separate Python/uv pipeline that harvests real defects, trains the detector, exports it to ONNX, and benchmarks it against a labelled roll. Nothing here ships in the app except the exported `.onnx` files.
+- `training/` — a separate Python/uv pipeline that harvests real defects, trains the detector, exports it to ONNX, and benchmarks it against a labelled roll. Nothing here ships in the app except the trained model itself.
 - `docs/superpowers/` — design docs and implementation plans.
 
 ## Toolchain
@@ -98,9 +113,9 @@ uv run pytest
 
 ## Models
 
-The healing model (LaMa, ONNX) is not bundled. The app downloads it on first use from a pinned Hugging Face revision and verifies it against a pinned SHA-256 before it's used (`app/src-tauri/src/models.rs`). Until it's downloaded, healing falls back to a classical fill with no neural inpainting.
+The healing model (LaMa, ONNX) is not bundled. The app downloads it on first use from a pinned Hugging Face revision and verifies it against a pinned SHA-256 before it's used (`app/src-tauri/src/model.rs`).
 
-**The defect detector is not trained yet.** It currently ships as a fixture model for development, not a model trained on real film — see `training/DATA.md` for the data collection plan and `training/README.md` for the training pipeline. Detection quality is expected to improve once a model is trained on real data and passes the benchmark gate described there.
+**The defect detector is not trained yet.** It currently ships as a fixture model for development, not a model trained on real film — see `training/DATA.md` for the data collection plan and `training/README.md` for the training flow.
 
 ## Working state per roll
 
@@ -108,7 +123,7 @@ When you open a roll (a folder of scans), the app keeps its working state next t
 
 - `roll.json` — per-frame state: sensitivity threshold, approval/export flags, brush strokes, detected defect boxes.
 - `thumbs/` — filmstrip thumbnails.
-- `cache/` — cached detection probabilities (`.probs`) and healed-pixel deltas (`.heal`), each keyed to the source file's content and the model that produced them, so a changed file or a changed model invalidates the cache automatically (`app/src-tauri/src/cache.rs`).
+- `cache/` — cached detection probabilities (`.probs`) and healed-pixel deltas (`.heal`), each keyed to the source file's content and the model that produced them, so a changed file or a changed model produces a fresh cache entry.
 
 Nothing here touches your original scan files. The app processes everything on
 your machine — it never uploads your scans and sends no telemetry.
