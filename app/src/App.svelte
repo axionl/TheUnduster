@@ -2162,11 +2162,11 @@
     {#if info}
       <div class="toolbar-group">
         <label>
-          Sensitivity
+          {t("sensitivity")}
           <input
             type="range"
             min="0.05"
-            max="0.95"
+            max="1"
             step="0.01"
             bind:value={overlay.threshold}
             oninput={onThresholdInput}

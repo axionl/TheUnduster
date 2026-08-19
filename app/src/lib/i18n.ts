@@ -16,6 +16,7 @@ const en: Dict = {
   tabGrade: "Color Grade",
   // File / frame toolbar
   openScan: "Open scan",
+  sensitivity: "Sensitivity",
   openRoll: "Open roll",
   detect: "Detect",
   detecting: "Detecting…",
@@ -77,6 +78,7 @@ const zh: Dict = {
   tabClean: "除尘",
   tabGrade: "校色",
   openScan: "打开扫描",
+  sensitivity: "敏感度",
   openRoll: "打开胶卷",
   detect: "检测",
   detecting: "检测中…",
